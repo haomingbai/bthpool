@@ -1,0 +1,44 @@
+# Build artifacts
+/build/
+/out/
+
+# CMake files
+CMakeCache.txt
+CMakeFiles/
+cmake-build-*/
+Testing/
+
+# Compiled objects
+*.o
+*.obj
+*.lo
+*.la
+*.a
+*.lib
+*.dll
+*.so
+*.dylib
+*.exe
+*.out
+
+# Generated files
+compile_commands.json
+Makefile
+*.ninja
+.ninja_log
+.ninja_deps
+
+# IDE/editor
+.vscode/
+.idea/
+*.code-workspace
+
+# C/C++ tools
+.cache/
+.ccls-cache/
+.clangd/
+.clang-format
+.clang-tidy
+
+# Misc
+.DS_Store

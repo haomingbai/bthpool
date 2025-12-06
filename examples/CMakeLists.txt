@@ -1,0 +1,2 @@
+add_executable(example_bthpool example.cpp)
+target_link_libraries(example_bthpool PRIVATE bthpool)
