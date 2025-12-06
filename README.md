@@ -116,7 +116,3 @@ Source references: see `include/bthpool/bthpool.hpp` — `BThreadPoolParam` (cor
 - `examples/`: Example program.
 - `tests/`: Basic tests.
 - `cmake/`: CMake config templates.
-
-## License
-
-This project is intended for educational and practical use. If you plan to redistribute, please add an appropriate license file.
