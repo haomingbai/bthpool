@@ -62,7 +62,9 @@ class BThreadPool {
   BThreadPool(BThreadPool&&) noexcept = delete;
   BThreadPool& operator=(const BThreadPool&) = delete;
   BThreadPool& operator=(BThreadPool&&) noexcept = delete;
-  ~BThreadPool() { shutdown(); }
+  ~BThreadPool() {
+    shutdown();
+  }
 
   /**
    * @brief Constructs a BThreadPool with default parameters and initializes
@@ -186,11 +188,9 @@ class BThreadPool {
    *   pool.post([&worker]{ worker.run(); });
    */
   template <typename F, typename... Args,
-            typename Ret =
-                std::invoke_result_t<std::decay_t<F>, std::decay_t<Args>...>>
+            typename Ret = std::invoke_result_t<std::decay_t<F>, std::decay_t<Args>...>>
   std::enable_if_t<std::is_void_v<Ret>, void> post(F&& f, Args&&... args) {
-    auto func_ptr = new ThreadFunc(
-        std::bind(std::forward<F>(f), std::forward<Args>(args)...));
+    auto func_ptr = new ThreadFunc(std::bind(std::forward<F>(f), std::forward<Args>(args)...));
     post(func_ptr);
   }
 
@@ -230,19 +230,15 @@ class BThreadPool {
    *          task execution.
    */
   template <typename F, typename... Args,
-            typename Ret =
-                std::invoke_result_t<std::decay_t<F>, std::decay_t<Args>...>>
+            typename Ret = std::invoke_result_t<std::decay_t<F>, std::decay_t<Args>...>>
   std::enable_if_t<!std::is_void_v<Ret>, void> post(F&& f, Args&&... args) {
     // Capture callable and arguments, execute, and discard the return value
-    auto func_ptr = new ThreadFunc(
-        [fn = std::forward<F>(f),
-         tup = std::make_tuple(std::forward<Args>(args)...)]() mutable {
-          (void)std::apply(
-              [&](auto&&... xs) -> Ret {
-                return std::invoke(fn, std::forward<decltype(xs)>(xs)...);
-              },
-              std::move(tup));
-        });
+    auto func_ptr = new ThreadFunc([fn = std::forward<F>(f),
+                                    tup = std::make_tuple(std::forward<Args>(args)...)]() mutable {
+      (void)std::apply(
+          [&](auto&&... xs) -> Ret { return std::invoke(fn, std::forward<decltype(xs)>(xs)...); },
+          std::move(tup));
+    });
     post(func_ptr);
   }
 
@@ -333,9 +329,8 @@ class BThreadPool {
   void post(ThreadFuncPtr func_ptr) {
     auto curr_num = living_thread_num_.load(std::memory_order_acquire);
     while (curr_num < param_.core_thread_num) {
-      if (living_thread_num_.compare_exchange_weak(curr_num, curr_num + 1,
-                                                   std::memory_order_acq_rel,
-                                                   std::memory_order_acquire)) {
+      if (living_thread_num_.compare_exchange_weak(
+              curr_num, curr_num + 1, std::memory_order_acq_rel, std::memory_order_acquire)) {
         // Get the lock.
         // Create a thread to execute the task immediately.
         auto worker_ptr = std::make_unique<ThreadWorker>(this);
@@ -353,8 +348,7 @@ class BThreadPool {
       // are available.
       while (curr_num < param_.max_thread_num) {
         if (living_thread_num_.compare_exchange_weak(
-                curr_num, curr_num + 1, std::memory_order_acq_rel,
-                std::memory_order_acquire)) {
+                curr_num, curr_num + 1, std::memory_order_acq_rel, std::memory_order_acquire)) {
           // Get the lock.
           // Create a thread to execute the task immediately.
           auto worker_ptr = std::make_unique<ThreadWorker>(this);
@@ -373,8 +367,7 @@ class BThreadPool {
    public:
     static void run(std::unique_ptr<ThreadWorker> self) noexcept;
 
-    explicit ThreadWorker(BThreadPool* pool)
-        : pool_(pool), should_stop_(false) {}
+    explicit ThreadWorker(BThreadPool* pool) : pool_(pool), should_stop_(false) {}
 
     ThreadWorker(const ThreadWorker&) = delete;
     ThreadWorker(ThreadWorker&&) noexcept = delete;
@@ -393,9 +386,13 @@ class BThreadPool {
       join();
     }
 
-    bool should_stop() const noexcept { return should_stop_.load(); }
+    bool should_stop() const noexcept {
+      return should_stop_.load();
+    }
 
-    void set_stop() noexcept { should_stop_.store(true); }
+    void set_stop() noexcept {
+      should_stop_.store(true);
+    }
 
    private:
     std::mutex mtx_;
@@ -413,8 +410,7 @@ class BThreadPool {
       worker_.reset();
     }
 
-    ThreadCleaner(std::unique_ptr<ThreadWorker> worker)
-        : worker_(std::move(worker)) {}
+    ThreadCleaner(std::unique_ptr<ThreadWorker> worker) : worker_(std::move(worker)) {}
 
     ThreadCleaner(ThreadCleaner&&) noexcept = default;
     ThreadCleaner& operator=(ThreadCleaner&&) noexcept = default;
@@ -430,17 +426,9 @@ class BThreadPool {
     explicit ThreadWorkerFunctor(BThreadPool* pool, ThreadWorker* worker)
         : pool_(pool), worker_(worker), curr_unscanned_time_(0) {}
 
-    // Rule-of-five: default destructor; forbid copy/move
-    ~ThreadWorkerFunctor() = default;
-    ThreadWorkerFunctor(const ThreadWorkerFunctor&) = default;
-    ThreadWorkerFunctor(ThreadWorkerFunctor&&) noexcept = default;
-    ThreadWorkerFunctor& operator=(const ThreadWorkerFunctor&) = default;
-    ThreadWorkerFunctor& operator=(ThreadWorkerFunctor&&) noexcept = default;
-        
     void operator()() noexcept {
       for (;;) {
-        if (pool_->stat_.load(std::memory_order_acquire) == STOPPED &&
-            worker_->should_stop()) {
+        if (pool_->stat_.load(std::memory_order_acquire) == STOPPED && worker_->should_stop()) {
           // Normal exit, no nead to clean because in the join function,
           // all threads are auto joinned.
           break;
@@ -470,8 +458,7 @@ class BThreadPool {
             break;
           }
           std::unique_lock<std::mutex> lock(pool_->mtx_);
-          pool_->cv_.wait_for(
-              lock, std::chrono::milliseconds(pool_->param_.suspend_time));
+          pool_->cv_.wait_for(lock, std::chrono::milliseconds(pool_->param_.suspend_time));
         }
       }
     }
@@ -504,12 +491,10 @@ class BThreadPool {
       if (pool_->stat_.load(std::memory_order_acquire) != RUNNING) {
         return true;
       }
-      std::ptrdiff_t curr_num =
-          pool_->living_thread_num_.load(std::memory_order_acquire);
+      std::ptrdiff_t curr_num = pool_->living_thread_num_.load(std::memory_order_acquire);
       while (curr_num > pool_->param_.core_thread_num) {
         if (pool_->living_thread_num_.compare_exchange_weak(
-                curr_num, curr_num - 1, std::memory_order_acq_rel,
-                std::memory_order_acquire)) {
+                curr_num, curr_num - 1, std::memory_order_acq_rel, std::memory_order_acquire)) {
           // Successfully get the lock.
           std::lock_guard<std::mutex> lock(pool_->map_mtx_);
           auto tid = std::this_thread::get_id();
@@ -555,8 +540,7 @@ class BThreadPool {
 
   // Thread map, which can find the thread worker and clean.
   std::mutex map_mtx_;
-  std::unordered_map<std::thread::id, std::unique_ptr<ThreadWorker>>
-      thread_map_;
+  std::unordered_map<std::thread::id, std::unique_ptr<ThreadWorker>> thread_map_;
 
   // Lock and conditional variable
   std::condition_variable cv_;
@@ -572,8 +556,7 @@ class BThreadPool {
   // (moved param_ above queues for correct initialization ordering)
 };
 
-inline void BThreadPool::ThreadWorker::run(
-    std::unique_ptr<ThreadWorker> self) noexcept {
+inline void BThreadPool::ThreadWorker::run(std::unique_ptr<ThreadWorker> self) noexcept {
   self->func_ = ThreadWorkerFunctor{self->pool_, self.get()};
   self->thread_ = std::thread(self->func_);
   auto tid = self->thread_.get_id();
