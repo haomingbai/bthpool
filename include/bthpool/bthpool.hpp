@@ -1,22 +1,45 @@
 /**
  * @file bthpool.hpp
- * @brief
- * @author Haoming Bai <haomingbai@hotmail.com>
- * @date   2025-12-05
+ * @brief Header for a lightweight, scalable thread pool.
  *
- * Copyright © 2025 Haoming Bai
- * SPDX-License-Identifier: MIT
+ * Provides `bthpool::detail::BThreadPool`, a configurable thread pool with
+ * fast/slow task queues, adaptive worker creation up to a maximum cap, and
+ * graceful shutdown semantics. Designed for high-throughput, latency-sensitive
+ * workloads and general-purpose asynchronous task execution.
  *
- * @details
+ * Key Features:
+ * - Dual-queue scheduling: fast queue (bounded) + slow queue (fallback).
+ * - Adaptive worker management: grows up to `max_thread_num` as needed.
+ * - Cooperative shutdown: `join()` for graceful, `shutdown()` for immediate.
+ * - Portable CPU detection; Linux and Windows support.
+ *
+ * Thread-Safety:
+ * - Public submission APIs are thread-safe.
+ * - Lifecycle methods (`join`, `shutdown`, `restart`) synchronize internally.
+ *
+ * Usage Sketch:
+ * @code
+ *   BThreadPool pool;              // or BThreadPool(BThreadPoolParam{})
+ *   pool.post([]{  work ; });  // fire-and-forget void task
+ *   pool.post([]{ return 42; });  // non-void result is discarded
+ *   pool.join();                   // wait for completion (graceful)
+ * @endcode
+ *
+ * @author  Haoming Bai <haomingbai@hotmail.com>
+ * @date    2025-12-07
+ * @version 0.1.0
+ * @copyright Copyright © 2025 Haoming Bai
+ * @license  MIT
+ * @see      include/bthpool/internal/safe_queue.hpp
  */
 
 #include <algorithm>
 #include <atomic>
 #include <cassert>
-#include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <functional>
+#include <future>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -247,6 +270,74 @@ class BThreadPool {
   }
 
   /**
+   * @brief Submit a task and get a `std::future` for its result.
+   *
+   * Usage:
+   *  - `auto fut = pool.futured_post([]{ return 42; });`
+   *  - `auto fut = pool.futured_post([](int x){ return x+1; }, 1);`
+  *  - `auto fut = pool.futured_post([]{});` // future<void>
+   *
+   * Returns a future corresponding to the callable's return type.
+   * If the callable returns `void`, the type is `std::future<void>`.
+   *
+   * Notes:
+   *  - Exceptions thrown inside the task are captured and set on the future.
+   *  - Callable and args are captured by move; ensure lifetimes are
+   * appropriate.
+   */
+  template <typename F, typename... Args,
+            typename Ret =
+                std::invoke_result_t<std::decay_t<F>, std::decay_t<Args>...>>
+  std::enable_if_t<std::is_void_v<Ret>, std::future<void>> futured_post(
+      F&& f, Args&&... args) {
+    auto promise = std::make_shared<std::promise<void>>();
+    auto fut = promise->get_future();
+    // Wrap task to fulfill promise regardless of success/failure.
+    auto func_ptr = new ThreadFunc(
+        [promise, fn = std::forward<F>(f),
+         tup = std::make_tuple(std::forward<Args>(args)...)]() mutable {
+          try {
+            std::apply(
+                [&](auto&&... xs) {
+                  std::invoke(fn, std::forward<decltype(xs)>(xs)...);
+                },
+                std::move(tup));
+            promise->set_value();
+          } catch (...) {
+            // Propagate exception to the future.
+            promise->set_exception(std::current_exception());
+          }
+        });
+    post(func_ptr);
+    return fut;
+  }
+
+  template <typename F, typename... Args,
+            typename Ret =
+                std::invoke_result_t<std::decay_t<F>, std::decay_t<Args>...>>
+  std::enable_if_t<!std::is_void_v<Ret>, std::future<Ret>> futured_post(
+      F&& f, Args&&... args) {
+    auto promise = std::make_shared<std::promise<Ret>>();
+    auto fut = promise->get_future();
+    auto func_ptr = new ThreadFunc(
+        [promise, fn = std::forward<F>(f),
+         tup = std::make_tuple(std::forward<Args>(args)...)]() mutable {
+          try {
+            Ret result = std::apply(
+                [&](auto&&... xs) -> Ret {
+                  return std::invoke(fn, std::forward<decltype(xs)>(xs)...);
+                },
+                std::move(tup));
+            promise->set_value(std::move(result));
+          } catch (...) {
+            promise->set_exception(std::current_exception());
+          }
+        });
+    post(func_ptr);
+    return fut;
+  }
+
+  /**
    * @brief Gracefully shuts down the thread pool by stopping worker threads and
    * waiting for all tasks to complete.
    *
@@ -365,7 +456,7 @@ class BThreadPool {
   }
 
  private:
-  using ThreadFunc = std::function<void()>;
+  using ThreadFunc = std::move_only_function<void()>;
   using ThreadFuncPtr = ThreadFunc*;
 
   void post(ThreadFuncPtr func_ptr) {
@@ -551,7 +642,7 @@ class BThreadPool {
           auto it = pool_->thread_map_.find(tid);
           if (it != pool_->thread_map_.end()) {
             // convert unique_ptr to shared_ptr for copyable lambda
-            ThreadWorker* worker_ptr(it->second.release());
+            auto worker_ptr(std::move(it->second));
             pool_->thread_map_.erase(it);
             // Cleanup in the next stage with copyable shared_ptr
             ThreadFuncPtr cleaner_ptr =
@@ -559,7 +650,7 @@ class BThreadPool {
                   if (worker) {
                     worker->set_stop();
                     worker->join();
-                    delete worker;
+                    worker.reset();
                   }
                 });
             pool_->post(cleaner_ptr);
@@ -572,11 +663,9 @@ class BThreadPool {
       // No need to clean.
       return false;
     }
-
     // The context of the thread function.
     BThreadPool* const pool_;
     ThreadWorker* const worker_;
-
     // Determine the behavior of the thread pool.
     std::size_t curr_unscanned_time_;
   };
@@ -610,7 +699,7 @@ class BThreadPool {
 inline void BThreadPool::ThreadWorker::run(
     std::unique_ptr<ThreadWorker> self) noexcept {
   self->func_ = ThreadWorkerFunctor{self->pool_, self.get()};
-  self->thread_ = std::thread(self->func_);
+  self->thread_ = std::thread(std::move(self->func_));
   auto tid = self->thread_.get_id();
   {
     std::lock_guard<std::mutex> lock(self->pool_->map_mtx_);

@@ -1,13 +1,34 @@
 /**
  * @file safe_queue.hpp
- * @brief
- * @author Haoming Bai <haomingbai@hotmail.com>
- * @date   2025-12-03
+ * @brief Thread-safe queues for task scheduling.
  *
- * Copyright © 2025 Haoming Bai
- * SPDX-License-Identifier: MIT
+ * Provides two queue implementations used by the thread pool:
+ * - `SafeQueue<T>`: mutex-based, simple FIFO for general usage.
+ * - `LockfreeFixedQueue<T>`: lock-free, fixed-capacity ring buffer optimized
+ *   for high-throughput scenarios.
  *
- * @details
+ * Both are designed to be used internally by `bthpool` to manage fast/slow
+ * task paths. `LockfreeFixedQueue` requires `T` to be trivially destructible
+ * and nothrow-constructible to guarantee non-blocking operations.
+ *
+ * Usage Sketch:
+ * @code
+ *   SafeQueue<int> q;
+ *   q.push(1);
+ *   int x;
+ *   if (q.pop(x)) {  consume ; }
+ *
+ *   LockfreeFixedQueue<int> lq(1024);
+ *   lq.push(42);
+ *   int y;
+ *   lq.pop(y);
+ * @endcode
+ *
+ * @author  Haoming Bai <haomingbai@hotmail.com>
+ * @date    2025-12-07
+ * @version 0.1.0
+ * @copyright Copyright © 2025 Haoming Bai
+ * @license  MIT
  */
 
 #pragma once
