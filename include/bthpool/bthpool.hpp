@@ -318,6 +318,14 @@ class BThreadPool {
    */
   void shutdown() {
     stat_.store(STOPPED);
+    // Clean the queues and release resources.
+    ThreadFuncPtr func_ptr;
+    while (fast_queue_.pop(func_ptr)) {
+      delete func_ptr;
+    }
+    while (slow_queue_.pop(func_ptr)) {
+      delete func_ptr;
+    }
     {
       std::lock_guard<std::mutex> lock(map_mtx_);
       cv_.notify_all();
@@ -327,14 +335,6 @@ class BThreadPool {
                       p.second->join();
                     });
       thread_map_.clear();
-    }
-    // Clean the queues and release resources.
-    ThreadFuncPtr func_ptr;
-    while (fast_queue_.pop(func_ptr)) {
-      delete func_ptr;
-    }
-    while (slow_queue_.pop(func_ptr)) {
-      delete func_ptr;
     }
   }
 
@@ -478,9 +478,10 @@ class BThreadPool {
         }
         // Determine whether the pool should scan from the slow queue.
         if (curr_unscanned_time_ >= pool_->param_.thread_clean_interval) {
-          // Clean the slow queue.
+          // Pop a task from the slow queue.
           ThreadFuncPtr func;
-          while (pool_->slow_queue_.pop(func)) {
+          if (pool_->slow_queue_.pop(func)) {
+            curr_unscanned_time_ = 0;
             execute_and_delete_function(func);
           }
         }
@@ -500,9 +501,9 @@ class BThreadPool {
             // If cleaned by a cleaner, than the thread should be joinned.
             break;
           }
+          // Sleep for a while to wait for a new task.
           std::unique_lock<std::mutex> lock(pool_->mtx_);
-          pool_->cv_.wait_for(
-              lock, std::chrono::milliseconds(pool_->param_.suspend_time));
+          pool_->cv_.wait(lock);
         }
       }
     }
@@ -522,10 +523,13 @@ class BThreadPool {
 
     ThreadFuncPtr try_get_task() {
       ThreadFuncPtr func = nullptr;
+      // Try to first
       auto succ = pool_->fast_queue_.pop(func);
       if (succ) {
         return func;
       } else if ((succ = pool_->slow_queue_.pop(func))) {
+        // Reset the scanner task of the slow queue.
+        curr_unscanned_time_ = 0;
         return func;
       }
       return nullptr;
