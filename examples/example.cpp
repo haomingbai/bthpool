@@ -1,6 +1,5 @@
 #include <atomic>
 #include <iostream>
-#include <vector>
 
 #include "bthpool/bthpool.hpp"
 

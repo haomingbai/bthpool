@@ -35,6 +35,9 @@
 
 #include <algorithm>
 #include <atomic>
+#ifdef USE_BOOST_ASIO_EXECUTOR
+#include <boost/asio/execution_context.hpp>
+#endif
 #include <cassert>
 #include <condition_variable>
 #include <cstddef>
@@ -78,14 +81,20 @@ struct BThreadPoolParam {
   std::size_t suspend_time{1};
 };
 
-class BThreadPool {
+class BThreadPool
+#ifdef USE_BOOST_ASIO_EXECUTOR
+    : public boost::asio::execution_context
+#endif
+{
  public:
   // Rule-of-five: define destructor; forbid copy/move
   BThreadPool(const BThreadPool&) = delete;
   BThreadPool(BThreadPool&&) noexcept = delete;
   BThreadPool& operator=(const BThreadPool&) = delete;
   BThreadPool& operator=(BThreadPool&&) noexcept = delete;
-  ~BThreadPool() { shutdown(); }
+  ~BThreadPool() {
+    shutdown();
+  }
 
   /**
    * @brief Constructs a BThreadPool with default parameters and initializes
@@ -209,11 +218,9 @@ class BThreadPool {
    *   pool.post([&worker]{ worker.run(); });
    */
   template <typename F, typename... Args,
-            typename Ret =
-                std::invoke_result_t<std::decay_t<F>, std::decay_t<Args>...>>
+            typename Ret = std::invoke_result_t<std::decay_t<F>, std::decay_t<Args>...>>
   std::enable_if_t<std::is_void_v<Ret>, void> post(F&& f, Args&&... args) {
-    auto func_ptr = new ThreadFunc(
-        std::bind(std::forward<F>(f), std::forward<Args>(args)...));
+    auto func_ptr = new ThreadFunc(std::bind(std::forward<F>(f), std::forward<Args>(args)...));
     post(func_ptr);
   }
 
@@ -253,20 +260,90 @@ class BThreadPool {
    *          task execution.
    */
   template <typename F, typename... Args,
-            typename Ret =
-                std::invoke_result_t<std::decay_t<F>, std::decay_t<Args>...>>
+            typename Ret = std::invoke_result_t<std::decay_t<F>, std::decay_t<Args>...>>
   std::enable_if_t<!std::is_void_v<Ret>, void> post(F&& f, Args&&... args) {
     // Capture callable and arguments, execute, and discard the return value
-    auto func_ptr = new ThreadFunc(
-        [fn = std::forward<F>(f),
-         tup = std::make_tuple(std::forward<Args>(args)...)]() mutable {
-          (void)std::apply(
-              [&](auto&&... xs) -> Ret {
-                return std::invoke(fn, std::forward<decltype(xs)>(xs)...);
-              },
-              std::move(tup));
-        });
+    auto func_ptr = new ThreadFunc([fn = std::forward<F>(f),
+                                    tup = std::make_tuple(std::forward<Args>(args)...)]() mutable {
+      (void)std::apply(
+          [&](auto&&... xs) -> Ret { return std::invoke(fn, std::forward<decltype(xs)>(xs)...); },
+          std::move(tup));
+    });
     post(func_ptr);
+  }
+
+  /**
+   * @brief Enqueue a task to the slow queue for deferred execution.
+   *
+   * This overload mirrors the `post` API but routes tasks directly to the slow
+   * queue, useful for lower-priority or backlog-friendly work. The callable is
+   * bound with its arguments and the return value (if any) is discarded.
+   *
+   * @tparam F Callable type. Must be invocable with Args... and return void.
+   * @tparam Args Argument types forwarded to the callable.
+   * @param f Callable to execute asynchronously on the slow queue.
+   * @param args Arguments to forward to the callable.
+   */
+  template <typename F, typename... Args,
+            typename Ret = std::invoke_result_t<std::decay_t<F>, std::decay_t<Args>...>>
+  std::enable_if_t<std::is_void_v<Ret>, void> defer(F&& f, Args&&... args) {
+    auto func_ptr = new ThreadFunc(std::bind(std::forward<F>(f), std::forward<Args>(args)...));
+    defer(func_ptr);
+  }
+
+  /**
+   * @brief Enqueue a non-void task to the slow queue, discarding its result.
+   *
+   * Like the void overload, this submits work to the slow queue for deferred
+   * processing. The callable's return value is intentionally ignored.
+   *
+   * @tparam F Callable type.
+   * @tparam Args Argument types forwarded to the callable.
+   * @tparam Ret Deduced non-void return type of the callable.
+   * @param f Callable to execute asynchronously on the slow queue.
+   * @param args Arguments to forward to the callable.
+   */
+  template <typename F, typename... Args,
+            typename Ret = std::invoke_result_t<std::decay_t<F>, std::decay_t<Args>...>>
+  std::enable_if_t<!std::is_void_v<Ret>, void> defer(F&& f, Args&&... args) {
+    auto func_ptr = new ThreadFunc([fn = std::forward<F>(f),
+                                    tup = std::make_tuple(std::forward<Args>(args)...)]() mutable {
+      (void)std::apply(
+          [&](auto&&... xs) -> Ret { return std::invoke(fn, std::forward<decltype(xs)>(xs)...); },
+          std::move(tup));
+    });
+    defer(func_ptr);
+  }
+
+  /**
+   * @brief Dispatch a callable for execution, either immediately or via the pool queue.
+   *
+   * If the caller thread is one of the pool's worker threads, the callable is invoked
+   * immediately (inline) on the calling thread. Otherwise, the callable is enqueued
+   * for execution by the pool (equivalent to calling @c post()).
+   *
+   * @tparam F    Callable type.
+   * @tparam Args Argument types forwarded to the callable.
+   * @param f     The callable to execute.
+   * @param args  Arguments to pass to the callable.
+   *
+   * @note Because execution may occur immediately, any side effects happen before
+   *       @c dispatch() returns when called from a worker thread.
+   */
+  template <typename F, typename... Args>
+  void dispatch(F&& f, Args&&... args) {
+    // Try to execute the task directly.
+    auto curr_tid = std::this_thread::get_id();
+    bool is_in_pool = false;
+    {
+      std::lock_guard lock(map_mtx_);
+      is_in_pool = thread_map_.contains(curr_tid);
+    }
+    if (is_in_pool) {
+      std::invoke(std::forward<F>(f), std::forward<Args>(args)...);
+    } else {
+      post(std::forward<F>(f), std::forward<Args>(args)...);
+    }
   }
 
   /**
@@ -275,7 +352,7 @@ class BThreadPool {
    * Usage:
    *  - `auto fut = pool.futured_post([]{ return 42; });`
    *  - `auto fut = pool.futured_post([](int x){ return x+1; }, 1);`
-  *  - `auto fut = pool.futured_post([]{});` // future<void>
+   *  - `auto fut = pool.futured_post([]{});` // future<void>
    *
    * Returns a future corresponding to the callable's return type.
    * If the callable returns `void`, the type is `std::future<void>`.
@@ -286,53 +363,42 @@ class BThreadPool {
    * appropriate.
    */
   template <typename F, typename... Args,
-            typename Ret =
-                std::invoke_result_t<std::decay_t<F>, std::decay_t<Args>...>>
-  std::enable_if_t<std::is_void_v<Ret>, std::future<void>> futured_post(
-      F&& f, Args&&... args) {
+            typename Ret = std::invoke_result_t<std::decay_t<F>, std::decay_t<Args>...>>
+  std::enable_if_t<std::is_void_v<Ret>, std::future<void>> futured_post(F&& f, Args&&... args) {
     auto promise = std::make_shared<std::promise<void>>();
     auto fut = promise->get_future();
     // Wrap task to fulfill promise regardless of success/failure.
-    auto func_ptr = new ThreadFunc(
-        [promise, fn = std::forward<F>(f),
-         tup = std::make_tuple(std::forward<Args>(args)...)]() mutable {
-          try {
-            std::apply(
-                [&](auto&&... xs) {
-                  std::invoke(fn, std::forward<decltype(xs)>(xs)...);
-                },
-                std::move(tup));
-            promise->set_value();
-          } catch (...) {
-            // Propagate exception to the future.
-            promise->set_exception(std::current_exception());
-          }
-        });
+    auto func_ptr = new ThreadFunc([promise, fn = std::forward<F>(f),
+                                    tup = std::make_tuple(std::forward<Args>(args)...)]() mutable {
+      try {
+        std::apply([&](auto&&... xs) { std::invoke(fn, std::forward<decltype(xs)>(xs)...); },
+                   std::move(tup));
+        promise->set_value();
+      } catch (...) {
+        // Propagate exception to the future.
+        promise->set_exception(std::current_exception());
+      }
+    });
     post(func_ptr);
     return fut;
   }
 
   template <typename F, typename... Args,
-            typename Ret =
-                std::invoke_result_t<std::decay_t<F>, std::decay_t<Args>...>>
-  std::enable_if_t<!std::is_void_v<Ret>, std::future<Ret>> futured_post(
-      F&& f, Args&&... args) {
+            typename Ret = std::invoke_result_t<std::decay_t<F>, std::decay_t<Args>...>>
+  std::enable_if_t<!std::is_void_v<Ret>, std::future<Ret>> futured_post(F&& f, Args&&... args) {
     auto promise = std::make_shared<std::promise<Ret>>();
     auto fut = promise->get_future();
-    auto func_ptr = new ThreadFunc(
-        [promise, fn = std::forward<F>(f),
-         tup = std::make_tuple(std::forward<Args>(args)...)]() mutable {
-          try {
-            Ret result = std::apply(
-                [&](auto&&... xs) -> Ret {
-                  return std::invoke(fn, std::forward<decltype(xs)>(xs)...);
-                },
-                std::move(tup));
-            promise->set_value(std::move(result));
-          } catch (...) {
-            promise->set_exception(std::current_exception());
-          }
-        });
+    auto func_ptr = new ThreadFunc([promise, fn = std::forward<F>(f),
+                                    tup = std::make_tuple(std::forward<Args>(args)...)]() mutable {
+      try {
+        Ret result = std::apply(
+            [&](auto&&... xs) -> Ret { return std::invoke(fn, std::forward<decltype(xs)>(xs)...); },
+            std::move(tup));
+        promise->set_value(std::move(result));
+      } catch (...) {
+        promise->set_exception(std::current_exception());
+      }
+    });
     post(func_ptr);
     return fut;
   }
@@ -379,11 +445,10 @@ class BThreadPool {
     {
       std::lock_guard<std::mutex> lock(map_mtx_);
       cv_.notify_all();
-      std::for_each(thread_map_.begin(), thread_map_.end(),
-                    [](auto& p) mutable {
-                      p.second->set_stop();
-                      p.second->join();
-                    });
+      std::for_each(thread_map_.begin(), thread_map_.end(), [](auto& p) mutable {
+        p.second->set_stop();
+        p.second->join();
+      });
       thread_map_.clear();
     }
     stat_.store(STOPPED);
@@ -420,11 +485,10 @@ class BThreadPool {
     {
       std::lock_guard<std::mutex> lock(map_mtx_);
       cv_.notify_all();
-      std::for_each(thread_map_.begin(), thread_map_.end(),
-                    [](auto& p) mutable {
-                      p.second->set_stop();
-                      p.second->join();
-                    });
+      std::for_each(thread_map_.begin(), thread_map_.end(), [](auto& p) mutable {
+        p.second->set_stop();
+        p.second->join();
+      });
       thread_map_.clear();
     }
   }
@@ -445,8 +509,8 @@ class BThreadPool {
       return;
     }
     Status stat = STOPPED;
-    while (!stat_.compare_exchange_weak(
-        stat, RUNNING, std::memory_order_acq_rel, std::memory_order_acquire)) {
+    while (!stat_.compare_exchange_weak(stat, RUNNING, std::memory_order_acq_rel,
+                                        std::memory_order_acquire)) {
       if (stat == RUNNING) {
         break;
       } else {
@@ -455,6 +519,43 @@ class BThreadPool {
     }
   }
 
+#ifdef USE_BOOST_ASIO_EXECUTOR
+  class BThreadPoolExecutor {
+   public:
+    BThreadPoolExecutor(const BThreadPoolExecutor&) noexcept = default;
+    BThreadPoolExecutor(BThreadPoolExecutor&&) noexcept = default;
+    BThreadPoolExecutor(BThreadPool* pool) : pool_(pool) {}
+    BThreadPoolExecutor& operator=(const BThreadPoolExecutor&) noexcept = default;
+    BThreadPoolExecutor& operator=(BThreadPoolExecutor&&) noexcept = default;
+
+    template <typename... Args>
+    void post(Args&&... args) {
+      pool_->post(std::forward<Args>(args)...);
+    }
+
+    template <typename... Args>
+    void defer(Args&&... args) {
+      pool_->defer(std::forward<Args>(args)...);
+    }
+
+    template <typename... Args>
+    void dispatch(Args&&... args) {
+      pool_->dispatch(std::forward<Args>(args)...);
+    }
+
+    BThreadPool& context() noexcept {
+      return *pool_;
+    }
+
+   private:
+    BThreadPool* pool_;
+  };
+
+  BThreadPoolExecutor get_executor() noexcept {
+    return BThreadPoolExecutor(this);
+  }
+#endif
+
  private:
   using ThreadFunc = std::move_only_function<void()>;
   using ThreadFuncPtr = ThreadFunc*;
@@ -462,9 +563,8 @@ class BThreadPool {
   void post(ThreadFuncPtr func_ptr) {
     auto curr_num = living_thread_num_.load(std::memory_order_acquire);
     while (curr_num < param_.core_thread_num) {
-      if (living_thread_num_.compare_exchange_weak(curr_num, curr_num + 1,
-                                                   std::memory_order_acq_rel,
-                                                   std::memory_order_acquire)) {
+      if (living_thread_num_.compare_exchange_weak(
+              curr_num, curr_num + 1, std::memory_order_acq_rel, std::memory_order_acquire)) {
         // Get the lock.
         // Create a thread to execute the task immediately.
         auto worker_ptr = std::make_unique<ThreadWorker>(this);
@@ -482,8 +582,7 @@ class BThreadPool {
       // are available.
       while (curr_num < param_.max_thread_num) {
         if (living_thread_num_.compare_exchange_weak(
-                curr_num, curr_num + 1, std::memory_order_acq_rel,
-                std::memory_order_acquire)) {
+                curr_num, curr_num + 1, std::memory_order_acq_rel, std::memory_order_acquire)) {
           // Get the lock.
           // Create a thread to execute the task immediately.
           auto worker_ptr = std::make_unique<ThreadWorker>(this);
@@ -498,12 +597,29 @@ class BThreadPool {
     }
   }
 
+  void defer(ThreadFuncPtr func_ptr) {
+    // If the thread is less than expected, then create a new one.
+    auto curr_num = living_thread_num_.load(std::memory_order_acquire);
+    while (curr_num < param_.core_thread_num) {
+      if (living_thread_num_.compare_exchange_weak(
+              curr_num, curr_num + 1, std::memory_order_acq_rel, std::memory_order_acquire)) {
+        // Get the lock.
+        // Create a thread to execute the task immediately.
+        auto worker_ptr = std::make_unique<ThreadWorker>(this);
+        ThreadWorker::run(std::move(worker_ptr));
+        break;
+      }
+    }
+    // Push the task into the slow queue to wait directly.
+    slow_queue_.push(func_ptr);
+    cv_.notify_one();
+  }
+
   class ThreadWorker {
    public:
     static void run(std::unique_ptr<ThreadWorker> self) noexcept;
 
-    explicit ThreadWorker(BThreadPool* pool)
-        : pool_(pool), should_stop_(false) {}
+    explicit ThreadWorker(BThreadPool* pool) : pool_(pool), should_stop_(false) {}
 
     ThreadWorker(const ThreadWorker&) = delete;
     ThreadWorker(ThreadWorker&&) noexcept = delete;
@@ -522,9 +638,13 @@ class BThreadPool {
       join();
     }
 
-    bool should_stop() const noexcept { return should_stop_.load(); }
+    bool should_stop() const noexcept {
+      return should_stop_.load();
+    }
 
-    void set_stop() noexcept { should_stop_.store(true); }
+    void set_stop() noexcept {
+      should_stop_.store(true);
+    }
 
    private:
     std::mutex mtx_;
@@ -542,8 +662,7 @@ class BThreadPool {
       worker_.reset();
     }
 
-    ThreadCleaner(std::unique_ptr<ThreadWorker> worker)
-        : worker_(std::move(worker)) {}
+    ThreadCleaner(std::unique_ptr<ThreadWorker> worker) : worker_(std::move(worker)) {}
 
     ThreadCleaner(ThreadCleaner&&) noexcept = default;
     ThreadCleaner& operator=(ThreadCleaner&&) noexcept = default;
@@ -561,8 +680,7 @@ class BThreadPool {
 
     void operator()() noexcept {
       for (;;) {
-        if (pool_->stat_.load(std::memory_order_acquire) == STOPPED &&
-            worker_->should_stop()) {
+        if (pool_->stat_.load(std::memory_order_acquire) == STOPPED && worker_->should_stop()) {
           // Normal exit, no nead to clean because in the join function,
           // all threads are auto joinned.
           break;
@@ -630,12 +748,10 @@ class BThreadPool {
       if (pool_->stat_.load(std::memory_order_acquire) != RUNNING) {
         return true;
       }
-      std::ptrdiff_t curr_num =
-          pool_->living_thread_num_.load(std::memory_order_acquire);
+      std::ptrdiff_t curr_num = pool_->living_thread_num_.load(std::memory_order_acquire);
       while (curr_num > pool_->param_.core_thread_num) {
         if (pool_->living_thread_num_.compare_exchange_weak(
-                curr_num, curr_num - 1, std::memory_order_acq_rel,
-                std::memory_order_acquire)) {
+                curr_num, curr_num - 1, std::memory_order_acq_rel, std::memory_order_acquire)) {
           // Successfully get the lock.
           std::lock_guard<std::mutex> lock(pool_->map_mtx_);
           auto tid = std::this_thread::get_id();
@@ -645,14 +761,13 @@ class BThreadPool {
             auto worker_ptr(std::move(it->second));
             pool_->thread_map_.erase(it);
             // Cleanup in the next stage with copyable shared_ptr
-            ThreadFuncPtr cleaner_ptr =
-                new ThreadFunc([worker = std::move(worker_ptr)]() mutable {
-                  if (worker) {
-                    worker->set_stop();
-                    worker->join();
-                    worker.reset();
-                  }
-                });
+            ThreadFuncPtr cleaner_ptr = new ThreadFunc([worker = std::move(worker_ptr)]() mutable {
+              if (worker) {
+                worker->set_stop();
+                worker->join();
+                worker.reset();
+              }
+            });
             pool_->post(cleaner_ptr);
           } else {
             return true;
@@ -679,8 +794,7 @@ class BThreadPool {
 
   // Thread map, which can find the thread worker and clean.
   std::mutex map_mtx_;
-  std::unordered_map<std::thread::id, std::unique_ptr<ThreadWorker>>
-      thread_map_;
+  std::unordered_map<std::thread::id, std::unique_ptr<ThreadWorker>> thread_map_;
 
   // Lock and conditional variable
   std::condition_variable cv_;
@@ -696,8 +810,7 @@ class BThreadPool {
   // (moved param_ above queues for correct initialization ordering)
 };
 
-inline void BThreadPool::ThreadWorker::run(
-    std::unique_ptr<ThreadWorker> self) noexcept {
+inline void BThreadPool::ThreadWorker::run(std::unique_ptr<ThreadWorker> self) noexcept {
   self->func_ = ThreadWorkerFunctor{self->pool_, self.get()};
   self->thread_ = std::thread(std::move(self->func_));
   auto tid = self->thread_.get_id();
