@@ -33,6 +33,10 @@
  * @see      include/bthpool/internal/safe_queue.hpp
  */
 
+#pragma once
+#ifndef BTHPOOL_BTHPOOL_HPP_
+#define BTHPOOL_BTHPOOL_HPP_
+
 #include <algorithm>
 #include <atomic>
 #ifdef USE_BOOST_ASIO_EXECUTOR
@@ -823,5 +827,8 @@ inline void BThreadPool::ThreadWorker::run(std::unique_ptr<ThreadWorker> self) n
 }  // namespace bthpool::detail
 
 namespace bthpool {
-using BThreadPool = detail::BThreadPool;
-}
+using detail::BThreadPool;
+using detail::BThreadPoolParam;
+}  // namespace bthpool
+
+#endif
