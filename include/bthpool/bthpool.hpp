@@ -57,27 +57,9 @@
 
 #include "internal/safe_queue.hpp"
 
-#ifndef __linux__
-#include "windows.h"
-#else
-#include <unistd.h>
-#endif
-
 namespace bthpool::detail {
-
-inline size_t get_nproc() noexcept {
-#ifndef __linux__
-  SYSTEM_INFO sysInfo;
-  GetSystemInfo(&sysInfo);
-  return static_cast<size_t>(sysInfo.dwNumberOfProcessors);
-#else
-  long n = sysconf(_SC_NPROCESSORS_ONLN);
-  return n > 0 ? static_cast<size_t>(n) : 1;
-#endif
-}
-
 struct BThreadPoolParam {
-  size_t core_thread_num{get_nproc()};
+  size_t core_thread_num{std::thread::hardware_concurrency()};
   size_t max_thread_num{std::numeric_limits<int>::max()};
   size_t fast_queue_capacity{0};
   size_t thread_clean_interval{60000};
