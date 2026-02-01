@@ -676,9 +676,10 @@ class BThreadPool
           // Pop a task from the slow queue.
           ThreadFuncPtr func;
           if (pool_->slow_queue_.pop(func)) {
-            curr_unscanned_time_ = 0;
             execute_and_delete_function(func);
           }
+          // Mark the slow queue as scanned.
+          curr_unscanned_time_ = 0;
         }
         // Get the task from fast queue.
         ThreadFuncPtr func = try_get_task();
@@ -688,7 +689,7 @@ class BThreadPool
           // If the thread pool needs joinning,
           // then exit.
           if (pool_->stat_.load(std::memory_order_acquire) == STOPPING) {
-            // Normal exit, no nead to clean because in the join function,
+            // Normal exit, no need to clean because in the join function,
             // all threads are auto joinned.
             break;
           }
