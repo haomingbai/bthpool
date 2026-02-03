@@ -302,18 +302,20 @@ class BThreadPool
   }
 
   /**
-   * @brief Dispatch a callable for execution, either immediately or via the pool queue.
+   * @brief Dispatch a callable for execution, either immediately or via the
+   * pool queue.
    *
-   * If the caller thread is one of the pool's worker threads, the callable is invoked
-   * immediately (inline) on the calling thread. Otherwise, the callable is enqueued
-   * for execution by the pool (equivalent to calling @c post()).
+   * If the caller thread is one of the pool's worker threads, the callable is
+   * invoked immediately (inline) on the calling thread. Otherwise, the callable
+   * is enqueued for execution by the pool (equivalent to calling @c post()).
    *
    * @tparam F    Callable type.
    * @tparam Args Argument types forwarded to the callable.
    * @param f     The callable to execute.
    * @param args  Arguments to pass to the callable.
    *
-   * @note Because execution may occur immediately, any side effects happen before
+   * @note Because execution may occur immediately, any side effects happen
+   * before
    *       @c dispatch() returns when called from a worker thread.
    */
   template <typename F, typename... Args>
@@ -325,7 +327,18 @@ class BThreadPool
       std::lock_guard lock(map_mtx_);
       is_in_pool = thread_map_.contains(curr_tid);
     }
-    if (is_in_pool) {
+    // Limit the max recursion depth to avoid stack overflow by counting the
+    // thread
+    if (is_in_pool && dispatch_depth_ < kMaxDispatchDepth) {
+      struct DispatchDepthGuard {
+        std::size_t& depth;
+        explicit DispatchDepthGuard(std::size_t& d) : depth(d) {
+          ++depth;
+        }
+        ~DispatchDepthGuard() {
+          --depth;
+        }
+      } guard(dispatch_depth_);
       std::invoke(std::forward<F>(f), std::forward<Args>(args)...);
     } else {
       post(std::forward<F>(f), std::forward<Args>(args)...);
@@ -793,6 +806,11 @@ class BThreadPool
 
   // Indicate the number of working thread.
   std::atomic<std::ptrdiff_t> living_thread_num_;
+
+  // The max recursion depth limit.
+  static constexpr std::size_t kMaxDispatchDepth = 32;
+  // Use thread_local to make sure that the depth count is for every thread.
+  static inline thread_local std::size_t dispatch_depth_ = 0;
 
   // (moved param_ above queues for correct initialization ordering)
 };
