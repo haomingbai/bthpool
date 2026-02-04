@@ -1,0 +1,158 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  validate-version:
+    runs-on: ubuntu-latest
+    outputs:
+      tag_name: ${{ steps.extract.outputs.tag_name }}
+      tag_version: ${{ steps.extract.outputs.tag_version }}
+      project_version: ${{ steps.project_version.outputs.project_version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Extract tag
+        id: extract
+        run: |
+          TAG_NAME="${GITHUB_REF_NAME}"
+          echo "tag_name=${TAG_NAME}" >> "$GITHUB_OUTPUT"
+          if [[ ! "$TAG_NAME" =~ ^v[0-9]+\.[0-9]+(\.[0-9]+)?$ ]]; then
+            echo "Tag format invalid: $TAG_NAME"
+            echo "Expected: v<major>.<minor> or v<major>.<minor>.<patch> (e.g., v0.1.2)"
+            exit 1
+          fi
+          TAG_VERSION="${TAG_NAME#v}"
+          echo "tag_version=${TAG_VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Read project version
+        id: project_version
+        run: |
+          PROJECT_VERSION="$(cmake -P scripts/get_project_version.cmake | tail -n 1)"
+          if [ -z "$PROJECT_VERSION" ]; then
+            echo "Failed to read PROJECT_VERSION from CMakeLists.txt"
+            exit 1
+          fi
+          echo "project_version=${PROJECT_VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Validate tag matches project version
+        run: |
+          if [ "${{ steps.extract.outputs.tag_version }}" != "${{ steps.project_version.outputs.project_version }}" ]; then
+            echo "Version mismatch. Tag=${{ steps.extract.outputs.tag_version }} PROJECT_VERSION=${{ steps.project_version.outputs.project_version }}"
+            echo "Fix: update project(... VERSION ...) in CMakeLists.txt or push a matching tag."
+            exit 1
+          fi
+
+  package:
+    runs-on: ubuntu-latest
+    needs: validate-version
+    strategy:
+      fail-fast: false
+      matrix:
+        compiler: [gcc]
+        with_boost: [ON, OFF]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            cmake \
+            ninja-build \
+            rpm \
+            dpkg-dev \
+            clang \
+            file
+
+      - name: Install Boost (optional)
+        if: matrix.with_boost == 'ON'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libboost-dev
+
+      - name: Configure
+        run: |
+          echo "==> Configuring (BTHPOOL_WITH_BOOST=${{ matrix.with_boost }})"
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBTHPOOL_WITH_BOOST=${{ matrix.with_boost }} \
+            -DBTHPOOL_BUILD_TESTS=OFF \
+            -DBTHPOOL_BUILD_EXAMPLES=OFF \
+            -DCPACK_OUTPUT_FILE_PREFIX="${GITHUB_WORKSPACE}/build/dist"
+
+      - name: Build
+        run: |
+          echo "==> Building"
+          cmake --build build --config Release --parallel
+
+      - name: Package (TGZ/DEB/RPM)
+        run: |
+          echo "==> Packaging"
+          (cd build && cpack -G TGZ)
+          (cd build && cpack -G DEB)
+          (cd build && cpack -G RPM)
+          ls -lah build/dist
+
+      - name: Upload package artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: bthpool-${{ runner.os }}-${{ matrix.compiler }}-boost${{ matrix.with_boost }}-${{ needs.validate-version.outputs.tag_name }}
+          path: build/dist/*
+
+  release:
+    runs-on: ubuntu-latest
+    needs: [validate-version, package]
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download package artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release_assets
+          merge-multiple: true
+
+      - name: Generate release notes
+        id: notes
+        run: |
+          TAG_NAME="${{ needs.validate-version.outputs.tag_name }}"
+          git fetch --tags --force
+          TAG_BODY="$(git tag -l --format='%(contents)' "$TAG_NAME")"
+          if [ -z "$TAG_BODY" ]; then
+            cat > release_notes.md << EOF
+Release ${TAG_NAME}
+
+Changes:
+- (auto) Update release notes in the tag annotation to replace this template.
+EOF
+          else
+            printf "%s\n" "$TAG_BODY" > release_notes.md
+          fi
+
+          PRERELEASE=false
+          if [[ "$TAG_NAME" =~ (rc|beta|alpha) ]]; then
+            PRERELEASE=true
+          fi
+          echo "prerelease=${PRERELEASE}" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.validate-version.outputs.tag_name }}
+          name: ${{ needs.validate-version.outputs.tag_name }}
+          body_path: release_notes.md
+          files: release_assets/**
+          prerelease: ${{ steps.notes.outputs.prerelease }}

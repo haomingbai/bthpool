@@ -1,0 +1,96 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+    tags-ignore: ["v*"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build-test-package:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        compiler: [gcc, clang]
+        with_boost: [ON, OFF]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            cmake \
+            ninja-build \
+            rpm \
+            dpkg-dev \
+            clang \
+            file
+
+      - name: Install Boost (optional)
+        if: matrix.with_boost == 'ON'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libboost-dev
+
+      - name: Set compiler
+        run: |
+          if [ "${{ matrix.compiler }}" = "clang" ]; then
+            echo "CC=clang" >> "$GITHUB_ENV"
+            echo "CXX=clang++" >> "$GITHUB_ENV"
+          else
+            echo "CC=gcc" >> "$GITHUB_ENV"
+            echo "CXX=g++" >> "$GITHUB_ENV"
+          fi
+
+      - name: Configure
+        run: |
+          echo "==> Configuring (BTHPOOL_WITH_BOOST=${{ matrix.with_boost }})"
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBTHPOOL_WITH_BOOST=${{ matrix.with_boost }} \
+            -DBTHPOOL_BUILD_TESTS=ON \
+            -DBTHPOOL_BUILD_EXAMPLES=OFF \
+            -DCPACK_OUTPUT_FILE_PREFIX="${GITHUB_WORKSPACE}/build/dist"
+
+      - name: Build
+        run: |
+          echo "==> Building"
+          cmake --build build --config Release --parallel
+
+      - name: Test (skip if none)
+        run: |
+          echo "==> Checking tests"
+          ctest --test-dir build -N | tee /tmp/ctest_list.txt
+          if grep -q "Total Tests: 0" /tmp/ctest_list.txt; then
+            echo "No tests found. Skipping."
+          else
+            echo "==> Running tests"
+            ctest --test-dir build --output-on-failure
+          fi
+
+      - name: Package (TGZ/DEB/RPM)
+        run: |
+          echo "==> Packaging"
+          cmake --build build --config Release --parallel
+          (cd build && cpack -G TGZ)
+          (cd build && cpack -G DEB)
+          (cd build && cpack -G RPM)
+          ls -lah build/dist
+
+      - name: Prepare artifact metadata
+        run: |
+          echo "SHORT_SHA=${GITHUB_SHA::7}" >> "$GITHUB_ENV"
+
+      - name: Upload package artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: bthpool-${{ runner.os }}-${{ matrix.compiler }}-boost${{ matrix.with_boost }}-${{ env.SHORT_SHA }}
+          path: build/dist/*
