@@ -14,4 +14,6 @@ if(NOT _bthpool_version_match)
 endif()
 
 set(BTHPOOL_PROJECT_VERSION "${CMAKE_MATCH_1}")
-message("${BTHPOOL_PROJECT_VERSION}")
+execute_process(
+  COMMAND "${CMAKE_COMMAND}" -E echo "${BTHPOOL_PROJECT_VERSION}"
+)
