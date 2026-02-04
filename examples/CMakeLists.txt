@@ -1,2 +1,14 @@
 add_executable(example_bthpool example.cpp)
 target_link_libraries(example_bthpool PRIVATE bthpool)
+
+add_executable(example_basic example_basic.cpp)
+target_link_libraries(example_basic PRIVATE bthpool)
+
+add_executable(example_advanced example_advanced.cpp)
+target_link_libraries(example_advanced PRIVATE bthpool)
+
+add_executable(example_concurrent example_concurrent.cpp)
+target_link_libraries(example_concurrent PRIVATE bthpool)
+
+add_executable(example_error_handling example_error_handling.cpp)
+target_link_libraries(example_error_handling PRIVATE bthpool)

@@ -158,7 +158,7 @@ class BThreadPool
    *   BThreadPool pool(param);
    *
    *   // Submit tasks / start the pool according to the API
-   *   // pool.submit([] {  `work`  });
+   *   // pool.post(task);
    *   // pool.start(); // if explicit start is required
    *
    * @see BThreadPoolParam for available configuration fields.
