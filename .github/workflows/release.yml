@@ -132,12 +132,7 @@ jobs:
           git fetch --tags --force
           TAG_BODY="$(git tag -l --format='%(contents)' "$TAG_NAME")"
           if [ -z "$TAG_BODY" ]; then
-            cat > release_notes.md << EOF
-Release ${TAG_NAME}
-
-Changes:
-- (auto) Update release notes in the tag annotation to replace this template.
-EOF
+            printf "Release %s\n\nChanges:\n- (auto) Update release notes in the tag annotation to replace this template.\n" "$TAG_NAME" > release_notes.md
           else
             printf "%s\n" "$TAG_BODY" > release_notes.md
           fi
