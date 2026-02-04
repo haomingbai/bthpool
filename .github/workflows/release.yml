@@ -154,5 +154,5 @@ EOF
           tag_name: ${{ needs.validate-version.outputs.tag_name }}
           name: ${{ needs.validate-version.outputs.tag_name }}
           body_path: release_notes.md
-          files: release_assets/**
+          files: "release_assets/**"
           prerelease: ${{ steps.notes.outputs.prerelease }}
