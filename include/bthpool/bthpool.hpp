@@ -653,25 +653,6 @@ class BThreadPool
     std::atomic<bool> should_stop_;
   };
 
-  class ThreadCleaner {
-   public:
-    void operator()() {
-      worker_->set_stop();
-      worker_->join();
-      worker_.reset();
-    }
-
-    ThreadCleaner(std::unique_ptr<ThreadWorker> worker) : worker_(std::move(worker)) {}
-
-    ThreadCleaner(ThreadCleaner&&) noexcept = default;
-    ThreadCleaner& operator=(ThreadCleaner&&) noexcept = default;
-    ThreadCleaner(const ThreadCleaner&) noexcept = delete;
-    ThreadCleaner& operator=(const ThreadCleaner&) noexcept = delete;
-
-   private:
-    std::unique_ptr<ThreadWorker> worker_;
-  };
-
   class ThreadWorkerFunctor {
    public:
     explicit ThreadWorkerFunctor(BThreadPool* pool, ThreadWorker* worker)
