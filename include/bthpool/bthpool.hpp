@@ -37,11 +37,11 @@
 #ifndef BTHPOOL_BTHPOOL_HPP_
 #define BTHPOOL_BTHPOOL_HPP_
 
-#include <algorithm>
-#include <atomic>
 #ifdef USE_BOOST_ASIO_EXECUTOR
 #include <boost/asio/execution_context.hpp>
 #endif
+#include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <condition_variable>
 #include <cstddef>
@@ -322,11 +322,10 @@ class BThreadPool
   void dispatch(F&& f, Args&&... args) {
     // Try to execute the task directly.
     auto curr_tid = std::this_thread::get_id();
-    bool is_in_pool = false;
-    {
-      std::lock_guard lock(map_mtx_);
-      is_in_pool = thread_map_.contains(curr_tid);
-    }
+
+    // Judge the current thread is in pool.
+    bool is_in_pool = dispatch_depth_ != 0 && current_pool_ == this;
+
     // Limit the max recursion depth to avoid stack overflow by counting the
     // thread
     if (is_in_pool && dispatch_depth_ < kMaxDispatchDepth) {
@@ -567,7 +566,7 @@ class BThreadPool
         // Get the lock.
         // Create a thread to execute the task immediately.
         auto worker_ptr = std::make_unique<ThreadWorker>(this);
-        ThreadWorker::run(std::move(worker_ptr));
+        ThreadWorker::run(this, std::move(worker_ptr));
         break;
       }
     }
@@ -585,7 +584,7 @@ class BThreadPool
           // Get the lock.
           // Create a thread to execute the task immediately.
           auto worker_ptr = std::make_unique<ThreadWorker>(this);
-          ThreadWorker::run(std::move(worker_ptr));
+          ThreadWorker::run(this, std::move(worker_ptr));
           break;
         }
       }
@@ -605,7 +604,7 @@ class BThreadPool
         // Get the lock.
         // Create a thread to execute the task immediately.
         auto worker_ptr = std::make_unique<ThreadWorker>(this);
-        ThreadWorker::run(std::move(worker_ptr));
+        ThreadWorker::run(this, std::move(worker_ptr));
         break;
       }
     }
@@ -616,9 +615,9 @@ class BThreadPool
 
   class ThreadWorker {
    public:
-    static void run(std::unique_ptr<ThreadWorker> self) noexcept;
+    static void run(BThreadPool* const pool, std::unique_ptr<ThreadWorker> self) noexcept;
 
-    explicit ThreadWorker(BThreadPool* pool) : pool_(pool), should_stop_(false) {}
+    explicit ThreadWorker(BThreadPool* pool) : should_stop_(false) {}
 
     ThreadWorker(const ThreadWorker&) = delete;
     ThreadWorker(ThreadWorker&&) noexcept = delete;
@@ -649,16 +648,20 @@ class BThreadPool
     std::mutex mtx_;
     ThreadFunc func_;
     std::thread thread_;
-    BThreadPool* const pool_;
     std::atomic<bool> should_stop_;
   };
 
   class ThreadWorkerFunctor {
    public:
-    explicit ThreadWorkerFunctor(BThreadPool* pool, ThreadWorker* worker)
+    explicit ThreadWorkerFunctor(BThreadPool* const pool, ThreadWorker* worker)
         : pool_(pool), worker_(worker), curr_unscanned_time_(0) {}
 
     void operator()() noexcept {
+      // Set some runtime status, to mark that
+      // the thread running is in the thread pool.
+      dispatch_depth_++;
+      pool_->current_pool_ = pool_;
+
       for (;;) {
         if (pool_->stat_.load(std::memory_order_acquire) == STOPPED && worker_->should_stop()) {
           // Normal exit, no nead to clean because in the join function,
@@ -759,11 +762,12 @@ class BThreadPool
       // No need to clean.
       return false;
     }
-    // The context of the thread function.
-    BThreadPool* const pool_;
+
     ThreadWorker* const worker_;
     // Determine the behavior of the thread pool.
     std::size_t curr_unscanned_time_;
+    // Temperory sotre the pointer of the thread pool.
+    BThreadPool* const pool_;
   };
 
   // Parameter of the thread pool.
@@ -790,19 +794,20 @@ class BThreadPool
 
   // The max recursion depth limit.
   static constexpr std::size_t kMaxDispatchDepth = 32;
+
   // Use thread_local to make sure that the depth count is for every thread.
   static inline thread_local std::size_t dispatch_depth_ = 0;
-
-  // (moved param_ above queues for correct initialization ordering)
+  static inline thread_local BThreadPool* current_pool_;
 };
 
-inline void BThreadPool::ThreadWorker::run(std::unique_ptr<ThreadWorker> self) noexcept {
-  self->func_ = ThreadWorkerFunctor{self->pool_, self.get()};
+inline void BThreadPool::ThreadWorker::run(BThreadPool* const pool,
+                                           std::unique_ptr<ThreadWorker> self) noexcept {
+  self->func_ = ThreadWorkerFunctor{pool, self.get()};
   self->thread_ = std::thread(std::move(self->func_));
   auto tid = self->thread_.get_id();
   {
-    std::lock_guard<std::mutex> lock(self->pool_->map_mtx_);
-    self->pool_->thread_map_.emplace(tid, std::move(self));
+    std::lock_guard<std::mutex> lock(pool->map_mtx_);
+    pool->thread_map_.emplace(tid, std::move(self));
   }
 }
 
