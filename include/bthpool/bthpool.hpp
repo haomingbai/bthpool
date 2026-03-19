@@ -517,42 +517,97 @@ class BThreadPool
     }
   }
 
-#ifdef USE_BOOST_ASIO_EXECUTOR
   class BThreadPoolExecutor {
    public:
+    using context_type = BThreadPool;
+    using allocator_type = std::allocator<void>;
+
+    BThreadPoolExecutor() noexcept : pool_(nullptr) {}
+    explicit BThreadPoolExecutor(BThreadPool* pool) noexcept : pool_(pool) {}
     BThreadPoolExecutor(const BThreadPoolExecutor&) noexcept = default;
     BThreadPoolExecutor(BThreadPoolExecutor&&) noexcept = default;
-    BThreadPoolExecutor(BThreadPool* pool) : pool_(pool) {}
     BThreadPoolExecutor& operator=(const BThreadPoolExecutor&) noexcept = default;
     BThreadPoolExecutor& operator=(BThreadPoolExecutor&&) noexcept = default;
+    ~BThreadPoolExecutor() = default;
+
+    allocator_type get_allocator() const noexcept {
+      return allocator_type{};
+    }
+
+    void on_work_started() const noexcept {}
+
+    void on_work_finished() const noexcept {}
+
+    template <typename F, typename Allocator>
+    void dispatch(F&& f, const Allocator&) const {
+      assert(pool_);
+      pool_->dispatch(std::forward<F>(f));
+    }
+
+    template <typename F, typename Allocator>
+    void post(F&& f, const Allocator&) const {
+      assert(pool_);
+      pool_->post(std::forward<F>(f));
+    }
+
+    template <typename F, typename Allocator>
+    void defer(F&& f, const Allocator&) const {
+      assert(pool_);
+      pool_->defer(std::forward<F>(f));
+    }
+
+    template <typename F>
+    void execute(F&& f) const {
+      assert(pool_);
+      pool_->post(std::forward<F>(f));
+    }
 
     template <typename... Args>
-    void post(Args&&... args) {
+    void post(Args&&... args) const {
+      assert(pool_);
       pool_->post(std::forward<Args>(args)...);
     }
 
     template <typename... Args>
-    void defer(Args&&... args) {
+    void defer(Args&&... args) const {
+      assert(pool_);
       pool_->defer(std::forward<Args>(args)...);
     }
 
     template <typename... Args>
-    void dispatch(Args&&... args) {
+    void dispatch(Args&&... args) const {
+      assert(pool_);
       pool_->dispatch(std::forward<Args>(args)...);
     }
 
-    BThreadPool& context() noexcept {
+    BThreadPool& context() const noexcept {
+      assert(pool_);
       return *pool_;
+    }
+
+    friend bool operator==(const BThreadPoolExecutor& lhs,
+                           const BThreadPoolExecutor& rhs) noexcept {
+      return lhs.pool_ == rhs.pool_;
+    }
+
+    friend bool operator!=(const BThreadPoolExecutor& lhs,
+                           const BThreadPoolExecutor& rhs) noexcept {
+      return !(lhs == rhs);
     }
 
    private:
     BThreadPool* pool_;
   };
 
+  using executor_type = BThreadPoolExecutor;
+
   BThreadPoolExecutor get_executor() noexcept {
     return BThreadPoolExecutor(this);
   }
-#endif
+
+  BThreadPoolExecutor get_executor() const noexcept {
+    return BThreadPoolExecutor(const_cast<BThreadPool*>(this));
+  }
 
  private:
   using ThreadFunc = std::move_only_function<void()>;
