@@ -38,7 +38,9 @@
 #define BTHPOOL_BTHPOOL_HPP_
 
 #ifdef USE_BOOST_ASIO_EXECUTOR
+#include <boost/asio/any_io_executor.hpp>
 #include <boost/asio/execution_context.hpp>
+#include <boost/asio/execution.hpp>
 #endif
 #include <algorithm>
 #include <atomic>
@@ -519,7 +521,11 @@ class BThreadPool
 
   class BThreadPoolExecutor {
    public:
+#ifdef USE_BOOST_ASIO_EXECUTOR
+    using context_type = boost::asio::execution_context;
+#else
     using context_type = BThreadPool;
+#endif
     using allocator_type = std::allocator<void>;
 
     BThreadPoolExecutor() noexcept : pool_(nullptr) {}
@@ -562,6 +568,66 @@ class BThreadPool
       pool_->post(std::forward<F>(f));
     }
 
+#ifdef USE_BOOST_ASIO_EXECUTOR
+    boost::asio::any_io_executor to_any_io_executor() const {
+      assert(pool_);
+      return boost::asio::any_io_executor(*this);
+    }
+
+    friend context_type& query(const BThreadPoolExecutor& ex,
+                               boost::asio::execution::context_t) noexcept {
+      return ex.context();
+    }
+
+    friend constexpr boost::asio::execution::blocking_t::never_t query(
+        const BThreadPoolExecutor&, boost::asio::execution::blocking_t) noexcept {
+      return boost::asio::execution::blocking.never;
+    }
+
+    friend constexpr boost::asio::execution::outstanding_work_t::untracked_t query(
+        const BThreadPoolExecutor&, boost::asio::execution::outstanding_work_t) noexcept {
+      return boost::asio::execution::outstanding_work.untracked;
+    }
+
+    friend constexpr boost::asio::execution::relationship_t::fork_t query(
+        const BThreadPoolExecutor&, boost::asio::execution::relationship_t) noexcept {
+      return boost::asio::execution::relationship.fork;
+    }
+
+    friend BThreadPoolExecutor require(const BThreadPoolExecutor& ex,
+                                       boost::asio::execution::blocking_t::never_t) noexcept {
+      return ex;
+    }
+
+    friend BThreadPoolExecutor prefer(const BThreadPoolExecutor& ex,
+                                      boost::asio::execution::blocking_t::possibly_t) noexcept {
+      return ex;
+    }
+
+    friend BThreadPoolExecutor prefer(
+        const BThreadPoolExecutor& ex,
+        boost::asio::execution::outstanding_work_t::tracked_t) noexcept {
+      return ex;
+    }
+
+    friend BThreadPoolExecutor prefer(
+        const BThreadPoolExecutor& ex,
+        boost::asio::execution::outstanding_work_t::untracked_t) noexcept {
+      return ex;
+    }
+
+    friend BThreadPoolExecutor prefer(const BThreadPoolExecutor& ex,
+                                      boost::asio::execution::relationship_t::fork_t) noexcept {
+      return ex;
+    }
+
+    friend BThreadPoolExecutor prefer(
+        const BThreadPoolExecutor& ex,
+        boost::asio::execution::relationship_t::continuation_t) noexcept {
+      return ex;
+    }
+#endif
+
     template <typename... Args>
     void post(Args&&... args) const {
       assert(pool_);
@@ -580,9 +646,13 @@ class BThreadPool
       pool_->dispatch(std::forward<Args>(args)...);
     }
 
-    BThreadPool& context() const noexcept {
+    context_type& context() const noexcept {
       assert(pool_);
+#ifdef USE_BOOST_ASIO_EXECUTOR
+      return static_cast<context_type&>(*pool_);
+#else
       return *pool_;
+#endif
     }
 
     friend bool operator==(const BThreadPoolExecutor& lhs,
