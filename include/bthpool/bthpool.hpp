@@ -47,10 +47,12 @@
 #include <cassert>
 #include <condition_variable>
 #include <cstddef>
+#include <deque>
 #include <functional>
 #include <future>
 #include <limits>
 #include <memory>
+#include <memory_resource>
 #include <mutex>
 #include <thread>
 #include <type_traits>
@@ -67,6 +69,7 @@ struct BThreadPoolParam {
   size_t thread_clean_interval{60000};
   size_t task_scan_interval{100};
   std::size_t suspend_time{1};
+  std::pmr::memory_resource* memory_resource{std::pmr::get_default_resource()};
 };
 
 class BThreadPool
@@ -74,6 +77,20 @@ class BThreadPool
     : public boost::asio::execution_context
 #endif
 {
+ private:
+  class ThreadWorker;
+  struct ThreadWorkerDeleter {
+    std::pmr::memory_resource* resource{std::pmr::get_default_resource()};
+    void operator()(ThreadWorker* ptr) const noexcept;
+  };
+  using ThreadWorkerPtr = std::unique_ptr<ThreadWorker, ThreadWorkerDeleter>;
+
+  using ThreadFunc = std::move_only_function<void()>;
+  using ThreadFuncPtr = ThreadFunc*;
+  using ThreadFuncAllocator = std::pmr::polymorphic_allocator<ThreadFunc>;
+  using SlowQueueContainer = std::pmr::deque<ThreadFuncPtr>;
+  using SlowQueueType = SafeQueue<ThreadFuncPtr, SlowQueueContainer>;
+
  public:
   // Rule-of-five: define destructor; forbid copy/move
   BThreadPool(const BThreadPool&) = delete;
@@ -119,12 +136,7 @@ class BThreadPool
    * 5. Gracefully shut down the pool (e.g., `stop()` or `join()`), ensuring all
    * tasks complete.
    */
-  BThreadPool()
-      : param_(),
-        slow_queue_(),
-        fast_queue_(param_.fast_queue_capacity),
-        stat_(RUNNING),
-        living_thread_num_(0) {}
+  BThreadPool() : BThreadPool(BThreadPoolParam{}) {}
 
   /**
    * @brief Constructs a BThreadPool with the specified parameters.
@@ -166,11 +178,17 @@ class BThreadPool
    * @see BThreadPoolParam for available configuration fields.
    */
   BThreadPool(BThreadPoolParam param)
-      : param_(param),
-        slow_queue_(),
-        fast_queue_(param_.fast_queue_capacity),
+      : param_(std::move(param)),
+        memory_resource_(param_.memory_resource ? param_.memory_resource
+                                                : std::pmr::get_default_resource()),
+        slow_queue_(SlowQueueContainer{memory_resource_}),
+        fast_queue_(param_.fast_queue_capacity, memory_resource_),
+        thread_map_(0, std::hash<std::thread::id>{}, std::equal_to<std::thread::id>{},
+                    memory_resource_),
         stat_(RUNNING),
-        living_thread_num_(0) {}
+        living_thread_num_(0) {
+    param_.memory_resource = memory_resource_;
+  }
 
   /**
    * @brief Schedule a task that returns void for execution by the thread pool.
@@ -208,7 +226,7 @@ class BThreadPool
   template <typename F, typename... Args,
             typename Ret = std::invoke_result_t<std::decay_t<F>, std::decay_t<Args>...>>
   std::enable_if_t<std::is_void_v<Ret>, void> post(F&& f, Args&&... args) {
-    auto func_ptr = new ThreadFunc(std::bind(std::forward<F>(f), std::forward<Args>(args)...));
+    auto func_ptr = make_thread_func(std::bind(std::forward<F>(f), std::forward<Args>(args)...));
     post(func_ptr);
   }
 
@@ -251,12 +269,14 @@ class BThreadPool
             typename Ret = std::invoke_result_t<std::decay_t<F>, std::decay_t<Args>...>>
   std::enable_if_t<!std::is_void_v<Ret>, void> post(F&& f, Args&&... args) {
     // Capture callable and arguments, execute, and discard the return value
-    auto func_ptr = new ThreadFunc([fn = std::forward<F>(f),
-                                    tup = std::make_tuple(std::forward<Args>(args)...)]() mutable {
-      (void)std::apply(
-          [&](auto&&... xs) -> Ret { return std::invoke(fn, std::forward<decltype(xs)>(xs)...); },
-          std::move(tup));
-    });
+    auto func_ptr = make_thread_func(
+        [fn = std::forward<F>(f), tup = std::make_tuple(std::forward<Args>(args)...)]() mutable {
+          (void)std::apply(
+              [&](auto&&... xs) -> Ret {
+                return std::invoke(fn, std::forward<decltype(xs)>(xs)...);
+              },
+              std::move(tup));
+        });
     post(func_ptr);
   }
 
@@ -275,7 +295,7 @@ class BThreadPool
   template <typename F, typename... Args,
             typename Ret = std::invoke_result_t<std::decay_t<F>, std::decay_t<Args>...>>
   std::enable_if_t<std::is_void_v<Ret>, void> defer(F&& f, Args&&... args) {
-    auto func_ptr = new ThreadFunc(std::bind(std::forward<F>(f), std::forward<Args>(args)...));
+    auto func_ptr = make_thread_func(std::bind(std::forward<F>(f), std::forward<Args>(args)...));
     defer(func_ptr);
   }
 
@@ -294,12 +314,14 @@ class BThreadPool
   template <typename F, typename... Args,
             typename Ret = std::invoke_result_t<std::decay_t<F>, std::decay_t<Args>...>>
   std::enable_if_t<!std::is_void_v<Ret>, void> defer(F&& f, Args&&... args) {
-    auto func_ptr = new ThreadFunc([fn = std::forward<F>(f),
-                                    tup = std::make_tuple(std::forward<Args>(args)...)]() mutable {
-      (void)std::apply(
-          [&](auto&&... xs) -> Ret { return std::invoke(fn, std::forward<decltype(xs)>(xs)...); },
-          std::move(tup));
-    });
+    auto func_ptr = make_thread_func(
+        [fn = std::forward<F>(f), tup = std::make_tuple(std::forward<Args>(args)...)]() mutable {
+          (void)std::apply(
+              [&](auto&&... xs) -> Ret {
+                return std::invoke(fn, std::forward<decltype(xs)>(xs)...);
+              },
+              std::move(tup));
+        });
     defer(func_ptr);
   }
 
@@ -365,20 +387,23 @@ class BThreadPool
   template <typename F, typename... Args,
             typename Ret = std::invoke_result_t<std::decay_t<F>, std::decay_t<Args>...>>
   std::enable_if_t<std::is_void_v<Ret>, std::future<void>> futured_post(F&& f, Args&&... args) {
-    auto promise = std::make_shared<std::promise<void>>();
+    auto promise = std::allocate_shared<std::promise<void>>(
+        std::pmr::polymorphic_allocator<std::promise<void>>(memory_resource_));
     auto fut = promise->get_future();
     // Wrap task to fulfill promise regardless of success/failure.
-    auto func_ptr = new ThreadFunc([promise, fn = std::forward<F>(f),
-                                    tup = std::make_tuple(std::forward<Args>(args)...)]() mutable {
-      try {
-        std::apply([&](auto&&... xs) { std::invoke(fn, std::forward<decltype(xs)>(xs)...); },
-                   std::move(tup));
-        promise->set_value();
-      } catch (...) {
-        // Propagate exception to the future.
-        promise->set_exception(std::current_exception());
-      }
-    });
+    auto func_ptr = make_thread_func(
+        [promise, fn = std::forward<F>(f), tup = std::make_tuple(std::forward<Args>(args)...)]()
+            mutable {
+              try {
+                std::apply(
+                    [&](auto&&... xs) { std::invoke(fn, std::forward<decltype(xs)>(xs)...); },
+                    std::move(tup));
+                promise->set_value();
+              } catch (...) {
+                // Propagate exception to the future.
+                promise->set_exception(std::current_exception());
+              }
+            });
     post(func_ptr);
     return fut;
   }
@@ -386,19 +411,23 @@ class BThreadPool
   template <typename F, typename... Args,
             typename Ret = std::invoke_result_t<std::decay_t<F>, std::decay_t<Args>...>>
   std::enable_if_t<!std::is_void_v<Ret>, std::future<Ret>> futured_post(F&& f, Args&&... args) {
-    auto promise = std::make_shared<std::promise<Ret>>();
+    auto promise = std::allocate_shared<std::promise<Ret>>(
+        std::pmr::polymorphic_allocator<std::promise<Ret>>(memory_resource_));
     auto fut = promise->get_future();
-    auto func_ptr = new ThreadFunc([promise, fn = std::forward<F>(f),
-                                    tup = std::make_tuple(std::forward<Args>(args)...)]() mutable {
-      try {
-        Ret result = std::apply(
-            [&](auto&&... xs) -> Ret { return std::invoke(fn, std::forward<decltype(xs)>(xs)...); },
-            std::move(tup));
-        promise->set_value(std::move(result));
-      } catch (...) {
-        promise->set_exception(std::current_exception());
-      }
-    });
+    auto func_ptr = make_thread_func(
+        [promise, fn = std::forward<F>(f), tup = std::make_tuple(std::forward<Args>(args)...)]()
+            mutable {
+              try {
+                Ret result = std::apply(
+                    [&](auto&&... xs) -> Ret {
+                      return std::invoke(fn, std::forward<decltype(xs)>(xs)...);
+                    },
+                    std::move(tup));
+                promise->set_value(std::move(result));
+              } catch (...) {
+                promise->set_exception(std::current_exception());
+              }
+            });
     post(func_ptr);
     return fut;
   }
@@ -477,10 +506,10 @@ class BThreadPool
     // Clean the queues and release resources.
     ThreadFuncPtr func_ptr;
     while (fast_queue_.pop(func_ptr)) {
-      delete func_ptr;
+      destroy_thread_func(func_ptr);
     }
     while (slow_queue_.pop(func_ptr)) {
-      delete func_ptr;
+      destroy_thread_func(func_ptr);
     }
     {
       std::lock_guard<std::mutex> lock(map_mtx_);
@@ -526,10 +555,14 @@ class BThreadPool
 #else
     using context_type = BThreadPool;
 #endif
-    using allocator_type = std::allocator<void>;
+    using allocator_type = std::pmr::polymorphic_allocator<void>;
 
-    BThreadPoolExecutor() noexcept : pool_(nullptr) {}
-    explicit BThreadPoolExecutor(BThreadPool* pool) noexcept : pool_(pool) {}
+    BThreadPoolExecutor() noexcept
+        : pool_(nullptr), memory_resource_(std::pmr::get_default_resource()) {}
+    explicit BThreadPoolExecutor(BThreadPool* pool) noexcept
+        : pool_(pool),
+          memory_resource_(pool ? pool->get_memory_resource()
+                                : std::pmr::get_default_resource()) {}
     BThreadPoolExecutor(const BThreadPoolExecutor&) noexcept = default;
     BThreadPoolExecutor(BThreadPoolExecutor&&) noexcept = default;
     BThreadPoolExecutor& operator=(const BThreadPoolExecutor&) noexcept = default;
@@ -537,7 +570,7 @@ class BThreadPool
     ~BThreadPoolExecutor() = default;
 
     allocator_type get_allocator() const noexcept {
-      return allocator_type{};
+      return allocator_type{memory_resource_};
     }
 
     void on_work_started() const noexcept {}
@@ -667,6 +700,7 @@ class BThreadPool
 
    private:
     BThreadPool* pool_;
+    std::pmr::memory_resource* memory_resource_;
   };
 
   using executor_type = BThreadPoolExecutor;
@@ -679,9 +713,35 @@ class BThreadPool
     return BThreadPoolExecutor(const_cast<BThreadPool*>(this));
   }
 
+  std::pmr::memory_resource* get_memory_resource() const noexcept {
+    return memory_resource_;
+  }
+
  private:
-  using ThreadFunc = std::move_only_function<void()>;
-  using ThreadFuncPtr = ThreadFunc*;
+  template <typename Fn>
+  ThreadFuncPtr make_thread_func(Fn&& fn) {
+    auto alloc = ThreadFuncAllocator(memory_resource_);
+    auto* ptr = std::allocator_traits<ThreadFuncAllocator>::allocate(alloc, 1);
+    try {
+      std::allocator_traits<ThreadFuncAllocator>::construct(alloc, ptr,
+                                                            std::forward<Fn>(fn));
+    } catch (...) {
+      std::allocator_traits<ThreadFuncAllocator>::deallocate(alloc, ptr, 1);
+      throw;
+    }
+    return ptr;
+  }
+
+  void destroy_thread_func(ThreadFuncPtr ptr) noexcept {
+    if (!ptr) {
+      return;
+    }
+    auto alloc = ThreadFuncAllocator(memory_resource_);
+    std::allocator_traits<ThreadFuncAllocator>::destroy(alloc, ptr);
+    std::allocator_traits<ThreadFuncAllocator>::deallocate(alloc, ptr, 1);
+  }
+
+  ThreadWorkerPtr make_thread_worker();
 
   void post(ThreadFuncPtr func_ptr) {
     auto curr_num = living_thread_num_.load(std::memory_order_acquire);
@@ -690,7 +750,7 @@ class BThreadPool
               curr_num, curr_num + 1, std::memory_order_acq_rel, std::memory_order_acquire)) {
         // Get the lock.
         // Create a thread to execute the task immediately.
-        auto worker_ptr = std::make_unique<ThreadWorker>(this);
+        auto worker_ptr = make_thread_worker();
         ThreadWorker::run(this, std::move(worker_ptr));
         break;
       }
@@ -708,7 +768,7 @@ class BThreadPool
                 curr_num, curr_num + 1, std::memory_order_acq_rel, std::memory_order_acquire)) {
           // Get the lock.
           // Create a thread to execute the task immediately.
-          auto worker_ptr = std::make_unique<ThreadWorker>(this);
+          auto worker_ptr = make_thread_worker();
           ThreadWorker::run(this, std::move(worker_ptr));
           break;
         }
@@ -728,7 +788,7 @@ class BThreadPool
               curr_num, curr_num + 1, std::memory_order_acq_rel, std::memory_order_acquire)) {
         // Get the lock.
         // Create a thread to execute the task immediately.
-        auto worker_ptr = std::make_unique<ThreadWorker>(this);
+        auto worker_ptr = make_thread_worker();
         ThreadWorker::run(this, std::move(worker_ptr));
         break;
       }
@@ -740,9 +800,9 @@ class BThreadPool
 
   class ThreadWorker {
    public:
-    static void run(BThreadPool* const pool, std::unique_ptr<ThreadWorker> self) noexcept;
+    static void run(BThreadPool* const pool, ThreadWorkerPtr self) noexcept;
 
-    explicit ThreadWorker(BThreadPool* pool) : should_stop_(false) {}
+    ThreadWorker() : should_stop_(false) {}
 
     ThreadWorker(const ThreadWorker&) = delete;
     ThreadWorker(ThreadWorker&&) noexcept = delete;
@@ -835,7 +895,7 @@ class BThreadPool
         } catch (...) {
           // Ignore exceptions.
         }
-        delete func;
+        pool_->destroy_thread_func(func);
       }
     }
 
@@ -866,17 +926,18 @@ class BThreadPool
           auto tid = std::this_thread::get_id();
           auto it = pool_->thread_map_.find(tid);
           if (it != pool_->thread_map_.end()) {
-            // convert unique_ptr to shared_ptr for copyable lambda
+            // Move ownership out of the worker map for async cleanup task.
             auto worker_ptr(std::move(it->second));
             pool_->thread_map_.erase(it);
-            // Cleanup in the next stage with copyable shared_ptr
-            ThreadFuncPtr cleaner_ptr = new ThreadFunc([worker = std::move(worker_ptr)]() mutable {
-              if (worker) {
-                worker->set_stop();
-                worker->join();
-                worker.reset();
-              }
-            });
+            // Cleanup in a move-only task.
+            ThreadFuncPtr cleaner_ptr = pool_->make_thread_func(
+                [worker = std::move(worker_ptr)]() mutable {
+                  if (worker) {
+                    worker->set_stop();
+                    worker->join();
+                    worker.reset();
+                  }
+                });
             pool_->post(cleaner_ptr);
           } else {
             return true;
@@ -896,15 +957,16 @@ class BThreadPool
   };
 
   // Parameter of the thread pool.
-  const BThreadPoolParam param_;
+  BThreadPoolParam param_;
+  std::pmr::memory_resource* memory_resource_;
 
   // Task queues, including a fast queue and a slow queue.
-  SafeQueue<ThreadFuncPtr> slow_queue_;
+  SlowQueueType slow_queue_;
   LockfreeFixedQueue<ThreadFuncPtr> fast_queue_;
 
   // Thread map, which can find the thread worker and clean.
   std::mutex map_mtx_;
-  std::unordered_map<std::thread::id, std::unique_ptr<ThreadWorker>> thread_map_;
+  std::pmr::unordered_map<std::thread::id, ThreadWorkerPtr> thread_map_;
 
   // Lock and conditional variable
   std::condition_variable cv_;
@@ -925,8 +987,29 @@ class BThreadPool
   static inline thread_local BThreadPool* current_pool_;
 };
 
-inline void BThreadPool::ThreadWorker::run(BThreadPool* const pool,
-                                           std::unique_ptr<ThreadWorker> self) noexcept {
+inline void BThreadPool::ThreadWorkerDeleter::operator()(ThreadWorker* ptr) const noexcept {
+  if (!ptr) {
+    return;
+  }
+  auto* actual_resource = resource ? resource : std::pmr::get_default_resource();
+  auto alloc = std::pmr::polymorphic_allocator<ThreadWorker>(actual_resource);
+  std::allocator_traits<decltype(alloc)>::destroy(alloc, ptr);
+  std::allocator_traits<decltype(alloc)>::deallocate(alloc, ptr, 1);
+}
+
+inline BThreadPool::ThreadWorkerPtr BThreadPool::make_thread_worker() {
+  auto alloc = std::pmr::polymorphic_allocator<ThreadWorker>(memory_resource_);
+  auto* ptr = std::allocator_traits<decltype(alloc)>::allocate(alloc, 1);
+  try {
+    std::allocator_traits<decltype(alloc)>::construct(alloc, ptr);
+  } catch (...) {
+    std::allocator_traits<decltype(alloc)>::deallocate(alloc, ptr, 1);
+    throw;
+  }
+  return ThreadWorkerPtr(ptr, ThreadWorkerDeleter{memory_resource_});
+}
+
+inline void BThreadPool::ThreadWorker::run(BThreadPool* const pool, ThreadWorkerPtr self) noexcept {
   self->func_ = ThreadWorkerFunctor{pool, self.get()};
   self->thread_ = std::thread(std::move(self->func_));
   auto tid = self->thread_.get_id();

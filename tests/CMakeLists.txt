@@ -33,8 +33,13 @@ add_executable(test_executor_compat test_executor_compat.cpp)
 target_link_libraries(test_executor_compat PRIVATE bthpool GTest::gtest_main Threads::Threads)
 target_compile_features(test_executor_compat PRIVATE cxx_std_23)
 
+add_executable(test_pmr_allocator test_pmr_allocator.cpp)
+target_link_libraries(test_pmr_allocator PRIVATE bthpool GTest::gtest_main Threads::Threads)
+target_compile_features(test_pmr_allocator PRIVATE cxx_std_23)
+
 include(GoogleTest)
 gtest_discover_tests(test_threadpool_basic)
 gtest_discover_tests(test_queue_basic)
 gtest_discover_tests(test_stress)
 gtest_discover_tests(test_executor_compat)
+gtest_discover_tests(test_pmr_allocator)

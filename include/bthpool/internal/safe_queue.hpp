@@ -41,6 +41,8 @@
 #include <cstddef>
 #include <deque>
 #include <limits>
+#include <memory>
+#include <memory_resource>
 #include <mutex>
 #include <queue>
 #include <type_traits>
@@ -60,6 +62,7 @@ class SafeQueue {
   ~SafeQueue() = default;
 
   SafeQueue() = default;
+  explicit SafeQueue(Container&& container) : queue_(std::move(container)) {}
 
   void push(const T& elem) {
     std::lock_guard<std::mutex> lock(mtx_);
@@ -132,14 +135,17 @@ class LockfreeFixedQueue {
                 "and constructible without exceprion.");
 
  public:
-  explicit LockfreeFixedQueue(std::size_t capacity)
+  explicit LockfreeFixedQueue(
+      std::size_t capacity,
+      std::pmr::memory_resource* resource = std::pmr::get_default_resource())
       : head_(0),
         tail_(0),
         // The capacity of the queue should be the power of 2.
         capacity_(generate_actual_capacity(capacity)),
         // mask can help the program to get the actual index effieiently.
         mask_(capacity_ - 1),
-        data_(new QueueNode[capacity_]) {
+        resource_(resource ? resource : std::pmr::get_default_resource()),
+        data_(allocate_nodes(capacity_, resource_)) {
     for (std::size_t i = 0; i < capacity_; i++) {
       std::atomic_store_explicit(&data_[i].head_, std::numeric_limits<std::size_t>::max(),
                                  std::memory_order_release);
@@ -147,7 +153,7 @@ class LockfreeFixedQueue {
     }
   }
 
-  LockfreeFixedQueue() : LockfreeFixedQueue(kFallbackCapacity) {}
+  LockfreeFixedQueue() : LockfreeFixedQueue(kFallbackCapacity, std::pmr::get_default_resource()) {}
 
   LockfreeFixedQueue(const LockfreeFixedQueue&) = delete;
   LockfreeFixedQueue(LockfreeFixedQueue&&) noexcept = delete;
@@ -155,7 +161,7 @@ class LockfreeFixedQueue {
   LockfreeFixedQueue& operator=(LockfreeFixedQueue&&) noexcept = delete;
 
   ~LockfreeFixedQueue() {
-    delete[] data_;
+    deallocate_nodes(data_, capacity_, resource_);
   }
 
   bool push(const T& elem) noexcept {
@@ -374,10 +380,32 @@ class LockfreeFixedQueue {
     }
   };
 
+  static QueueNode* allocate_nodes(std::size_t n, std::pmr::memory_resource* resource) {
+    auto alloc = std::pmr::polymorphic_allocator<QueueNode>(resource);
+    auto* data = alloc.allocate(n);
+    for (std::size_t i = 0; i < n; ++i) {
+      std::construct_at(data + i);
+    }
+    return data;
+  }
+
+  static void deallocate_nodes(QueueNode* data, std::size_t n,
+                               std::pmr::memory_resource* resource) noexcept {
+    if (!data) {
+      return;
+    }
+    for (std::size_t i = 0; i < n; ++i) {
+      std::destroy_at(data + i);
+    }
+    auto alloc = std::pmr::polymorphic_allocator<QueueNode>(resource);
+    alloc.deallocate(data, n);
+  }
+
   std::atomic<std::size_t> head_, tail_;
   const std::size_t capacity_;
   const std::size_t mask_;
-  QueueNode* const data_;
+  std::pmr::memory_resource* resource_;
+  QueueNode* data_;
 };
 
 }  // namespace internal
