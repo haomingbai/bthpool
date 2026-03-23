@@ -6,7 +6,7 @@
 #include "bthpool/bthpool.hpp"
 
 int main() {
-  bthpool::BThreadPool pool;
+  bthpool::BThreadPool<> pool;
 
   std::atomic<int> sum{0};
   const int n = 10;

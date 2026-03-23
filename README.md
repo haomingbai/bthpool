@@ -31,7 +31,7 @@ ctest --test-dir build --output-on-failure
 #include <iostream>
 
 int main() {
-    bthpool::BThreadPool pool;
+    bthpool::BThreadPool<> pool;
 
     pool.post([] { std::cout << "hello from worker" << std::endl; });
 
@@ -52,8 +52,9 @@ pool.post([] { /* do work without a return value */ });
 
 ## API Overview
 
+- `BThreadPool<Allocator = std::allocator<std::byte>>`: Thread pool type templated by allocator.
 - `BThreadPoolParam`: Configuration (e.g., `core_thread_num`, `max_thread_num`, `fast_queue_capacity`, `thread_clean_interval`).
-- `BThreadPool()`, `BThreadPool(BThreadPoolParam)`: Create a pool with default or custom parameters.
+- `BThreadPool()`, `BThreadPool(BThreadPoolParam, Allocator)`: Create a pool with default or custom parameters plus optional allocator.
 - `post(F&&, Args&&...)`: Fire-and-forget submission; return values are discarded. Exceptions are ignored.
 - `defer(F&&, Args&&...)`: Enqueue directly to the slow queue.
 - `dispatch(F&&, Args&&...)`: Execute inline when called from a worker; otherwise enqueue.
@@ -73,6 +74,7 @@ pool.post([] { /* do work without a return value */ });
 ## Core Concepts
 
 - `BThreadPoolParam` controls thread sizing and queue behavior. If `core_thread_num` is `0` (possible when `std::thread::hardware_concurrency()` returns `0`), set it explicitly.
+- Use `BThreadPool<>` for default allocator behavior, or pass a custom allocator instance to the constructor when allocator tracking/routing is needed.
 - `post` and `defer` discard return values; use `futured_post` to observe results or exceptions.
 - `dispatch` may run inline when called from a pool worker, which can reduce scheduling overhead.
 

@@ -13,7 +13,7 @@ int main() {
   param.fast_queue_capacity = 64;
   param.thread_clean_interval = 200;
 
-  bthpool::BThreadPool pool(param);
+  bthpool::BThreadPool<> pool(param);
 
   for (int i = 0; i < 8; ++i) {
     pool.post([i] { (void)i; });

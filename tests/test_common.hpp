@@ -1,6 +1,6 @@
 // Shared test adapters and utilities.
 // Assumptions/Adapter Notes:
-// 1) ThreadPool type is bthpool::BThreadPool, configurable via bthpool::BThreadPoolParam.
+// 1) ThreadPool type is bthpool::BThreadPool<>, configurable via bthpool::BThreadPoolParam.
 //    If your project exposes a different name or constructor signature, adapt
 //    `make_pool()` and the aliases below.
 // 2) ThreadPool supports: post/defer/dispatch, futured_post, join, shutdown.
@@ -29,7 +29,7 @@
 #include "bthpool/internal/safe_queue.hpp"
 
 namespace test_adapter {
-using Pool = bthpool::BThreadPool;
+using Pool = bthpool::BThreadPool<>;
 using PoolParam = bthpool::BThreadPoolParam;
 using bthpool::internal::LockfreeFixedQueue;
 using bthpool::internal::SafeQueue;

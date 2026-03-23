@@ -38,11 +38,11 @@
 
 #include <atomic>
 #include <cassert>
+#include <concepts>
 #include <cstddef>
 #include <deque>
 #include <limits>
 #include <memory>
-#include <memory_resource>
 #include <mutex>
 #include <queue>
 #include <type_traits>
@@ -128,24 +128,32 @@ class SafeQueue {
   std::queue<T, Container> queue_;
 };
 
-template <typename T>
+template <typename Allocator, typename T>
+concept RebindableAllocatorFor = requires {
+  typename std::allocator_traits<Allocator>::template rebind_alloc<T>;
+} && std::copy_constructible<Allocator> && std::default_initializable<Allocator>;
+
+template <typename T, typename Allocator = std::allocator<T>>
+  requires RebindableAllocatorFor<Allocator, T>
 class LockfreeFixedQueue {
   static_assert(std::is_trivially_destructible_v<T> && std::is_nothrow_constructible_v<T>,
                 "LockfreeFixedQueue requires T to be trivially destructible "
                 "and constructible without exceprion.");
 
  public:
+  using allocator_type = Allocator;
+
   explicit LockfreeFixedQueue(
       std::size_t capacity,
-      std::pmr::memory_resource* resource = std::pmr::get_default_resource())
+      allocator_type alloc = allocator_type{})
       : head_(0),
         tail_(0),
         // The capacity of the queue should be the power of 2.
         capacity_(generate_actual_capacity(capacity)),
         // mask can help the program to get the actual index effieiently.
         mask_(capacity_ - 1),
-        resource_(resource ? resource : std::pmr::get_default_resource()),
-        data_(allocate_nodes(capacity_, resource_)) {
+        allocator_(std::move(alloc)),
+        data_(allocate_nodes(capacity_, allocator_)) {
     for (std::size_t i = 0; i < capacity_; i++) {
       std::atomic_store_explicit(&data_[i].head_, std::numeric_limits<std::size_t>::max(),
                                  std::memory_order_release);
@@ -153,7 +161,7 @@ class LockfreeFixedQueue {
     }
   }
 
-  LockfreeFixedQueue() : LockfreeFixedQueue(kFallbackCapacity, std::pmr::get_default_resource()) {}
+  LockfreeFixedQueue() : LockfreeFixedQueue(kFallbackCapacity, allocator_type{}) {}
 
   LockfreeFixedQueue(const LockfreeFixedQueue&) = delete;
   LockfreeFixedQueue(LockfreeFixedQueue&&) noexcept = delete;
@@ -161,7 +169,7 @@ class LockfreeFixedQueue {
   LockfreeFixedQueue& operator=(LockfreeFixedQueue&&) noexcept = delete;
 
   ~LockfreeFixedQueue() {
-    deallocate_nodes(data_, capacity_, resource_);
+    deallocate_nodes(data_, capacity_, allocator_);
   }
 
   bool push(const T& elem) noexcept {
@@ -380,9 +388,12 @@ class LockfreeFixedQueue {
     }
   };
 
-  static QueueNode* allocate_nodes(std::size_t n, std::pmr::memory_resource* resource) {
-    auto alloc = std::pmr::polymorphic_allocator<QueueNode>(resource);
-    auto* data = alloc.allocate(n);
+  using QueueNodeAllocator = typename std::allocator_traits<allocator_type>::template rebind_alloc<QueueNode>;
+  using QueueNodeAllocatorTraits = std::allocator_traits<QueueNodeAllocator>;
+
+  static QueueNode* allocate_nodes(std::size_t n, const allocator_type& allocator) {
+    QueueNodeAllocator alloc(allocator);
+    auto* data = QueueNodeAllocatorTraits::allocate(alloc, n);
     for (std::size_t i = 0; i < n; ++i) {
       std::construct_at(data + i);
     }
@@ -390,21 +401,21 @@ class LockfreeFixedQueue {
   }
 
   static void deallocate_nodes(QueueNode* data, std::size_t n,
-                               std::pmr::memory_resource* resource) noexcept {
+                               const allocator_type& allocator) noexcept {
     if (!data) {
       return;
     }
     for (std::size_t i = 0; i < n; ++i) {
       std::destroy_at(data + i);
     }
-    auto alloc = std::pmr::polymorphic_allocator<QueueNode>(resource);
-    alloc.deallocate(data, n);
+    QueueNodeAllocator alloc(allocator);
+    QueueNodeAllocatorTraits::deallocate(alloc, data, n);
   }
 
   std::atomic<std::size_t> head_, tail_;
   const std::size_t capacity_;
   const std::size_t mask_;
-  std::pmr::memory_resource* resource_;
+  allocator_type allocator_;
   QueueNode* data_;
 };
 

@@ -6,7 +6,7 @@
 #include <stdexcept>
 
 int main() {
-  bthpool::BThreadPool pool;
+  bthpool::BThreadPool<> pool;
 
   auto fut = pool.futured_post([]() -> int {
     throw std::runtime_error("task failed");

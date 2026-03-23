@@ -11,9 +11,9 @@
 
 TEST(ExecutorCompat, SupportsAnyIoExecutorTypeErasure) {
   static_assert(std::is_constructible_v<boost::asio::any_io_executor,
-                                        bthpool::BThreadPool::executor_type>);
+                                        bthpool::BThreadPool<>::executor_type>);
 
-  bthpool::BThreadPool pool;
+  bthpool::BThreadPool<> pool;
   boost::asio::any_io_executor ex(pool.get_executor());
 
   std::promise<int> promise;

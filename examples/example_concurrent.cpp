@@ -13,7 +13,7 @@ int main() {
   param.max_thread_num = 8;
   param.fast_queue_capacity = 128;
 
-  bthpool::BThreadPool pool(param);
+  bthpool::BThreadPool<> pool(param);
 
   std::atomic<int> total{0};
   const int producers = 4;

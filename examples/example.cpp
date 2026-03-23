@@ -6,7 +6,7 @@
 int main() {
   std::cout << "bthpool example running..." << std::endl;
 
-  bthpool::BThreadPool pool;
+  bthpool::BThreadPool<> pool;
 
   std::atomic<int> sum{0};
   for (int i = 0; i < 8; ++i) {

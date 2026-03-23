@@ -3,79 +3,96 @@
 #include <atomic>
 #include <cstddef>
 #include <future>
-#include <memory_resource>
+#include <memory>
 #include <type_traits>
 
 #include "bthpool/bthpool.hpp"
 
 namespace {
 
-class CountingResource : public std::pmr::memory_resource {
+struct CountingAllocatorState {
+  std::atomic<std::size_t> allocate_count{0};
+  std::atomic<std::size_t> deallocate_count{0};
+  std::atomic<std::ptrdiff_t> live_bytes{0};
+};
+
+template <typename T>
+class CountingAllocator {
  public:
-  explicit CountingResource(std::pmr::memory_resource* upstream = std::pmr::new_delete_resource())
-      : upstream_(upstream) {}
+  using value_type = T;
 
-  std::size_t allocate_count() const noexcept {
-    return allocate_count_.load(std::memory_order_relaxed);
+  CountingAllocator() : state_(std::make_shared<CountingAllocatorState>()) {}
+
+  explicit CountingAllocator(std::shared_ptr<CountingAllocatorState> state)
+      : state_(std::move(state)) {
+    if (!state_) {
+      state_ = std::make_shared<CountingAllocatorState>();
+    }
   }
 
-  std::size_t deallocate_count() const noexcept {
-    return deallocate_count_.load(std::memory_order_relaxed);
+  CountingAllocator(const CountingAllocator&) noexcept = default;
+  CountingAllocator& operator=(const CountingAllocator&) noexcept = default;
+
+  // Keep moved-from allocator valid by sharing state instead of emptying it.
+  CountingAllocator(CountingAllocator&& other) noexcept : state_(other.state_) {}
+  CountingAllocator& operator=(CountingAllocator&& other) noexcept {
+    state_ = other.state_;
+    return *this;
   }
 
-  std::ptrdiff_t live_bytes() const noexcept {
-    return live_bytes_.load(std::memory_order_relaxed);
+  template <typename U>
+  CountingAllocator(const CountingAllocator<U>& other) noexcept : state_(other.state_) {}
+
+  T* allocate(std::size_t n) {
+    state_->allocate_count.fetch_add(1, std::memory_order_relaxed);
+    state_->live_bytes.fetch_add(static_cast<std::ptrdiff_t>(n * sizeof(T)),
+                                 std::memory_order_relaxed);
+    return std::allocator<T>{}.allocate(n);
   }
 
- protected:
-  void* do_allocate(std::size_t bytes, std::size_t alignment) override {
-    allocate_count_.fetch_add(1, std::memory_order_relaxed);
-    live_bytes_.fetch_add(static_cast<std::ptrdiff_t>(bytes), std::memory_order_relaxed);
-    return upstream_->allocate(bytes, alignment);
+  void deallocate(T* ptr, std::size_t n) noexcept {
+    if (!ptr) {
+      return;
+    }
+    state_->deallocate_count.fetch_add(1, std::memory_order_relaxed);
+    state_->live_bytes.fetch_sub(static_cast<std::ptrdiff_t>(n * sizeof(T)),
+                                 std::memory_order_relaxed);
+    std::allocator<T>{}.deallocate(ptr, n);
   }
 
-  void do_deallocate(void* p, std::size_t bytes, std::size_t alignment) override {
-    deallocate_count_.fetch_add(1, std::memory_order_relaxed);
-    live_bytes_.fetch_sub(static_cast<std::ptrdiff_t>(bytes), std::memory_order_relaxed);
-    upstream_->deallocate(p, bytes, alignment);
+  std::shared_ptr<CountingAllocatorState> state() const noexcept {
+    return state_;
   }
 
-  bool do_is_equal(const std::pmr::memory_resource& other) const noexcept override {
-    return this == &other;
+  template <typename U>
+  bool operator==(const CountingAllocator<U>& other) const noexcept {
+    return state_ == other.state_;
+  }
+
+  template <typename U>
+  bool operator!=(const CountingAllocator<U>& other) const noexcept {
+    return !(*this == other);
   }
 
  private:
-  std::pmr::memory_resource* upstream_;
-  std::atomic<std::size_t> allocate_count_{0};
-  std::atomic<std::size_t> deallocate_count_{0};
-  std::atomic<std::ptrdiff_t> live_bytes_{0};
+  template <typename>
+  friend class CountingAllocator;
+
+  std::shared_ptr<CountingAllocatorState> state_;
 };
 
-class ScopedDefaultResource {
- public:
-  explicit ScopedDefaultResource(std::pmr::memory_resource* resource)
-      : old_(std::pmr::set_default_resource(resource)) {}
-
-  ~ScopedDefaultResource() {
-    std::pmr::set_default_resource(old_);
-  }
-
-  ScopedDefaultResource(const ScopedDefaultResource&) = delete;
-  ScopedDefaultResource& operator=(const ScopedDefaultResource&) = delete;
-
- private:
-  std::pmr::memory_resource* old_;
-};
+using PoolAllocator = CountingAllocator<std::byte>;
+using Pool = bthpool::BThreadPool<PoolAllocator>;
 
 }  // namespace
 
-TEST(PmrAllocator, UsesProvidedResourceForTasks) {
-  CountingResource resource;
+TEST(AllocatorMode, UsesProvidedAllocatorForTasks) {
+  auto state = std::make_shared<CountingAllocatorState>();
+
   {
     bthpool::BThreadPoolParam param;
-    param.memory_resource = &resource;
+    Pool pool(param, PoolAllocator{state});
 
-    bthpool::BThreadPool pool(param);
     std::promise<void> promise;
     auto future = promise.get_future();
     pool.post([&promise] { promise.set_value(); });
@@ -83,20 +100,19 @@ TEST(PmrAllocator, UsesProvidedResourceForTasks) {
     pool.join();
   }
 
-  EXPECT_GT(resource.allocate_count(), 0u);
-  EXPECT_GT(resource.deallocate_count(), 0u);
-  EXPECT_EQ(resource.live_bytes(), 0);
+  EXPECT_GT(state->allocate_count.load(std::memory_order_relaxed), 0u);
+  EXPECT_GT(state->deallocate_count.load(std::memory_order_relaxed), 0u);
+  EXPECT_EQ(state->live_bytes.load(std::memory_order_relaxed), 0);
 }
 
-TEST(PmrAllocator, FallsBackToDefaultResourceWhenNull) {
-  CountingResource default_resource;
-  ScopedDefaultResource guard(&default_resource);
+TEST(AllocatorMode, UsesDefaultAllocatorWhenNotProvided) {
+  std::shared_ptr<CountingAllocatorState> state;
 
   {
     bthpool::BThreadPoolParam param;
-    param.memory_resource = nullptr;
+    Pool pool(param);
+    state = pool.get_allocator().state();
 
-    bthpool::BThreadPool pool(param);
     std::promise<void> promise;
     auto future = promise.get_future();
     pool.post([&promise] { promise.set_value(); });
@@ -104,22 +120,22 @@ TEST(PmrAllocator, FallsBackToDefaultResourceWhenNull) {
     pool.join();
   }
 
-  EXPECT_GT(default_resource.allocate_count(), 0u);
-  EXPECT_GT(default_resource.deallocate_count(), 0u);
-  EXPECT_EQ(default_resource.live_bytes(), 0);
+  ASSERT_NE(state, nullptr);
+  EXPECT_GT(state->allocate_count.load(std::memory_order_relaxed), 0u);
+  EXPECT_GT(state->deallocate_count.load(std::memory_order_relaxed), 0u);
+  EXPECT_EQ(state->live_bytes.load(std::memory_order_relaxed), 0);
 }
 
-TEST(PmrAllocator, ExecutorAllocatorUsesPoolResource) {
-  CountingResource resource;
+TEST(AllocatorMode, ExecutorAllocatorUsesPoolAllocator) {
+  auto state = std::make_shared<CountingAllocatorState>();
   bthpool::BThreadPoolParam param;
-  param.memory_resource = &resource;
+  Pool pool(param, PoolAllocator{state});
 
-  bthpool::BThreadPool pool(param);
   auto ex = pool.get_executor();
   auto alloc = ex.get_allocator();
 
-  static_assert(std::is_same_v<decltype(alloc), std::pmr::polymorphic_allocator<void>>);
-  EXPECT_EQ(alloc.resource(), &resource);
+  static_assert(std::is_same_v<decltype(alloc), PoolAllocator>);
+  EXPECT_EQ(alloc.state(), state);
 
   pool.join();
 }

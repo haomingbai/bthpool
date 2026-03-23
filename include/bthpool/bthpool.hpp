@@ -45,6 +45,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cassert>
+#include <concepts>
 #include <condition_variable>
 #include <cstddef>
 #include <deque>
@@ -52,7 +53,6 @@
 #include <future>
 #include <limits>
 #include <memory>
-#include <memory_resource>
 #include <mutex>
 #include <thread>
 #include <type_traits>
@@ -69,9 +69,16 @@ struct BThreadPoolParam {
   size_t thread_clean_interval{60000};
   size_t task_scan_interval{100};
   std::size_t suspend_time{1};
-  std::pmr::memory_resource* memory_resource{std::pmr::get_default_resource()};
 };
 
+template <typename Allocator>
+concept ThreadPoolAllocator = requires(Allocator alloc) {
+  typename std::allocator_traits<Allocator>::value_type;
+  typename std::allocator_traits<Allocator>::template rebind_alloc<std::byte>;
+  { Allocator(alloc) };
+} && std::copy_constructible<Allocator> && std::default_initializable<Allocator>;
+
+template <ThreadPoolAllocator Allocator = std::allocator<std::byte>>
 class BThreadPool
 #ifdef USE_BOOST_ASIO_EXECUTOR
     : public boost::asio::execution_context
@@ -79,19 +86,34 @@ class BThreadPool
 {
  private:
   class ThreadWorker;
+  using allocator_type = Allocator;
+
+  template <typename T>
+  using RebindAllocator = typename std::allocator_traits<allocator_type>::template rebind_alloc<T>;
+  template <typename T>
+  using RebindAllocatorTraits = std::allocator_traits<RebindAllocator<T>>;
+
   struct ThreadWorkerDeleter {
-    std::pmr::memory_resource* resource{std::pmr::get_default_resource()};
+    allocator_type allocator{};
     void operator()(ThreadWorker* ptr) const noexcept;
   };
   using ThreadWorkerPtr = std::unique_ptr<ThreadWorker, ThreadWorkerDeleter>;
 
   using ThreadFunc = std::move_only_function<void()>;
   using ThreadFuncPtr = ThreadFunc*;
-  using ThreadFuncAllocator = std::pmr::polymorphic_allocator<ThreadFunc>;
-  using SlowQueueContainer = std::pmr::deque<ThreadFuncPtr>;
+  using ThreadFuncAllocator = RebindAllocator<ThreadFunc>;
+  using SlowQueueContainer = std::deque<ThreadFuncPtr, RebindAllocator<ThreadFuncPtr>>;
   using SlowQueueType = SafeQueue<ThreadFuncPtr, SlowQueueContainer>;
+  using FastQueueType = LockfreeFixedQueue<ThreadFuncPtr, RebindAllocator<ThreadFuncPtr>>;
+  using ThreadMapValueType = std::pair<const std::thread::id, ThreadWorkerPtr>;
+  using ThreadMapAllocator = RebindAllocator<ThreadMapValueType>;
+  using ThreadMapType =
+      std::unordered_map<std::thread::id, ThreadWorkerPtr, std::hash<std::thread::id>,
+                         std::equal_to<std::thread::id>, ThreadMapAllocator>;
 
  public:
+  using pool_allocator_type = allocator_type;
+
   // Rule-of-five: define destructor; forbid copy/move
   BThreadPool(const BThreadPool&) = delete;
   BThreadPool(BThreadPool&&) noexcept = delete;
@@ -136,7 +158,7 @@ class BThreadPool
    * 5. Gracefully shut down the pool (e.g., `stop()` or `join()`), ensuring all
    * tasks complete.
    */
-  BThreadPool() : BThreadPool(BThreadPoolParam{}) {}
+  BThreadPool() : BThreadPool(BThreadPoolParam{}, allocator_type{}) {}
 
   /**
    * @brief Constructs a BThreadPool with the specified parameters.
@@ -177,18 +199,15 @@ class BThreadPool
    *
    * @see BThreadPoolParam for available configuration fields.
    */
-  BThreadPool(BThreadPoolParam param)
+  BThreadPool(BThreadPoolParam param, allocator_type alloc = allocator_type{})
       : param_(std::move(param)),
-        memory_resource_(param_.memory_resource ? param_.memory_resource
-                                                : std::pmr::get_default_resource()),
-        slow_queue_(SlowQueueContainer{memory_resource_}),
-        fast_queue_(param_.fast_queue_capacity, memory_resource_),
+        allocator_(std::move(alloc)),
+        slow_queue_(SlowQueueContainer{RebindAllocator<ThreadFuncPtr>(allocator_)}),
+        fast_queue_(param_.fast_queue_capacity, RebindAllocator<ThreadFuncPtr>(allocator_)),
         thread_map_(0, std::hash<std::thread::id>{}, std::equal_to<std::thread::id>{},
-                    memory_resource_),
+                    ThreadMapAllocator(allocator_)),
         stat_(RUNNING),
-        living_thread_num_(0) {
-    param_.memory_resource = memory_resource_;
-  }
+        living_thread_num_(0) {}
 
   /**
    * @brief Schedule a task that returns void for execution by the thread pool.
@@ -387,8 +406,8 @@ class BThreadPool
   template <typename F, typename... Args,
             typename Ret = std::invoke_result_t<std::decay_t<F>, std::decay_t<Args>...>>
   std::enable_if_t<std::is_void_v<Ret>, std::future<void>> futured_post(F&& f, Args&&... args) {
-    auto promise = std::allocate_shared<std::promise<void>>(
-        std::pmr::polymorphic_allocator<std::promise<void>>(memory_resource_));
+    auto promise =
+        std::allocate_shared<std::promise<void>>(RebindAllocator<std::promise<void>>(allocator_));
     auto fut = promise->get_future();
     // Wrap task to fulfill promise regardless of success/failure.
     auto func_ptr = make_thread_func(
@@ -411,8 +430,8 @@ class BThreadPool
   template <typename F, typename... Args,
             typename Ret = std::invoke_result_t<std::decay_t<F>, std::decay_t<Args>...>>
   std::enable_if_t<!std::is_void_v<Ret>, std::future<Ret>> futured_post(F&& f, Args&&... args) {
-    auto promise = std::allocate_shared<std::promise<Ret>>(
-        std::pmr::polymorphic_allocator<std::promise<Ret>>(memory_resource_));
+    auto promise = std::allocate_shared<std::promise<Ret>>(RebindAllocator<std::promise<Ret>>(
+        allocator_));
     auto fut = promise->get_future();
     auto func_ptr = make_thread_func(
         [promise, fn = std::forward<F>(f), tup = std::make_tuple(std::forward<Args>(args)...)]()
@@ -555,14 +574,12 @@ class BThreadPool
 #else
     using context_type = BThreadPool;
 #endif
-    using allocator_type = std::pmr::polymorphic_allocator<void>;
+    using allocator_type = typename BThreadPool::pool_allocator_type;
 
-    BThreadPoolExecutor() noexcept
-        : pool_(nullptr), memory_resource_(std::pmr::get_default_resource()) {}
+    BThreadPoolExecutor() noexcept : pool_(nullptr), allocator_() {}
     explicit BThreadPoolExecutor(BThreadPool* pool) noexcept
         : pool_(pool),
-          memory_resource_(pool ? pool->get_memory_resource()
-                                : std::pmr::get_default_resource()) {}
+          allocator_(pool ? pool->get_allocator() : allocator_type{}) {}
     BThreadPoolExecutor(const BThreadPoolExecutor&) noexcept = default;
     BThreadPoolExecutor(BThreadPoolExecutor&&) noexcept = default;
     BThreadPoolExecutor& operator=(const BThreadPoolExecutor&) noexcept = default;
@@ -570,27 +587,27 @@ class BThreadPool
     ~BThreadPoolExecutor() = default;
 
     allocator_type get_allocator() const noexcept {
-      return allocator_type{memory_resource_};
+      return allocator_;
     }
 
     void on_work_started() const noexcept {}
 
     void on_work_finished() const noexcept {}
 
-    template <typename F, typename Allocator>
-    void dispatch(F&& f, const Allocator&) const {
+    template <typename F, typename ExecutorAllocator>
+    void dispatch(F&& f, const ExecutorAllocator&) const {
       assert(pool_);
       pool_->dispatch(std::forward<F>(f));
     }
 
-    template <typename F, typename Allocator>
-    void post(F&& f, const Allocator&) const {
+    template <typename F, typename ExecutorAllocator>
+    void post(F&& f, const ExecutorAllocator&) const {
       assert(pool_);
       pool_->post(std::forward<F>(f));
     }
 
-    template <typename F, typename Allocator>
-    void defer(F&& f, const Allocator&) const {
+    template <typename F, typename ExecutorAllocator>
+    void defer(F&& f, const ExecutorAllocator&) const {
       assert(pool_);
       pool_->defer(std::forward<F>(f));
     }
@@ -700,7 +717,7 @@ class BThreadPool
 
    private:
     BThreadPool* pool_;
-    std::pmr::memory_resource* memory_resource_;
+    allocator_type allocator_;
   };
 
   using executor_type = BThreadPoolExecutor;
@@ -713,20 +730,19 @@ class BThreadPool
     return BThreadPoolExecutor(const_cast<BThreadPool*>(this));
   }
 
-  std::pmr::memory_resource* get_memory_resource() const noexcept {
-    return memory_resource_;
+  allocator_type get_allocator() const noexcept {
+    return allocator_;
   }
 
  private:
   template <typename Fn>
   ThreadFuncPtr make_thread_func(Fn&& fn) {
-    auto alloc = ThreadFuncAllocator(memory_resource_);
-    auto* ptr = std::allocator_traits<ThreadFuncAllocator>::allocate(alloc, 1);
+    ThreadFuncAllocator alloc(allocator_);
+    auto* ptr = RebindAllocatorTraits<ThreadFunc>::allocate(alloc, 1);
     try {
-      std::allocator_traits<ThreadFuncAllocator>::construct(alloc, ptr,
-                                                            std::forward<Fn>(fn));
+      RebindAllocatorTraits<ThreadFunc>::construct(alloc, ptr, std::forward<Fn>(fn));
     } catch (...) {
-      std::allocator_traits<ThreadFuncAllocator>::deallocate(alloc, ptr, 1);
+      RebindAllocatorTraits<ThreadFunc>::deallocate(alloc, ptr, 1);
       throw;
     }
     return ptr;
@@ -736,9 +752,9 @@ class BThreadPool
     if (!ptr) {
       return;
     }
-    auto alloc = ThreadFuncAllocator(memory_resource_);
-    std::allocator_traits<ThreadFuncAllocator>::destroy(alloc, ptr);
-    std::allocator_traits<ThreadFuncAllocator>::deallocate(alloc, ptr, 1);
+    ThreadFuncAllocator alloc(allocator_);
+    RebindAllocatorTraits<ThreadFunc>::destroy(alloc, ptr);
+    RebindAllocatorTraits<ThreadFunc>::deallocate(alloc, ptr, 1);
   }
 
   ThreadWorkerPtr make_thread_worker();
@@ -958,15 +974,15 @@ class BThreadPool
 
   // Parameter of the thread pool.
   BThreadPoolParam param_;
-  std::pmr::memory_resource* memory_resource_;
+  allocator_type allocator_;
 
   // Task queues, including a fast queue and a slow queue.
   SlowQueueType slow_queue_;
-  LockfreeFixedQueue<ThreadFuncPtr> fast_queue_;
+  FastQueueType fast_queue_;
 
   // Thread map, which can find the thread worker and clean.
   std::mutex map_mtx_;
-  std::pmr::unordered_map<std::thread::id, ThreadWorkerPtr> thread_map_;
+  ThreadMapType thread_map_;
 
   // Lock and conditional variable
   std::condition_variable cv_;
@@ -987,29 +1003,32 @@ class BThreadPool
   static inline thread_local BThreadPool* current_pool_;
 };
 
-inline void BThreadPool::ThreadWorkerDeleter::operator()(ThreadWorker* ptr) const noexcept {
+template <ThreadPoolAllocator Allocator>
+inline void BThreadPool<Allocator>::ThreadWorkerDeleter::operator()(ThreadWorker* ptr) const noexcept {
   if (!ptr) {
     return;
   }
-  auto* actual_resource = resource ? resource : std::pmr::get_default_resource();
-  auto alloc = std::pmr::polymorphic_allocator<ThreadWorker>(actual_resource);
-  std::allocator_traits<decltype(alloc)>::destroy(alloc, ptr);
-  std::allocator_traits<decltype(alloc)>::deallocate(alloc, ptr, 1);
+  RebindAllocator<ThreadWorker> alloc(allocator);
+  RebindAllocatorTraits<ThreadWorker>::destroy(alloc, ptr);
+  RebindAllocatorTraits<ThreadWorker>::deallocate(alloc, ptr, 1);
 }
 
-inline BThreadPool::ThreadWorkerPtr BThreadPool::make_thread_worker() {
-  auto alloc = std::pmr::polymorphic_allocator<ThreadWorker>(memory_resource_);
-  auto* ptr = std::allocator_traits<decltype(alloc)>::allocate(alloc, 1);
+template <ThreadPoolAllocator Allocator>
+inline typename BThreadPool<Allocator>::ThreadWorkerPtr BThreadPool<Allocator>::make_thread_worker() {
+  RebindAllocator<ThreadWorker> alloc(allocator_);
+  auto* ptr = RebindAllocatorTraits<ThreadWorker>::allocate(alloc, 1);
   try {
-    std::allocator_traits<decltype(alloc)>::construct(alloc, ptr);
+    RebindAllocatorTraits<ThreadWorker>::construct(alloc, ptr);
   } catch (...) {
-    std::allocator_traits<decltype(alloc)>::deallocate(alloc, ptr, 1);
+    RebindAllocatorTraits<ThreadWorker>::deallocate(alloc, ptr, 1);
     throw;
   }
-  return ThreadWorkerPtr(ptr, ThreadWorkerDeleter{memory_resource_});
+  return ThreadWorkerPtr(ptr, ThreadWorkerDeleter{allocator_});
 }
 
-inline void BThreadPool::ThreadWorker::run(BThreadPool* const pool, ThreadWorkerPtr self) noexcept {
+template <ThreadPoolAllocator Allocator>
+inline void BThreadPool<Allocator>::ThreadWorker::run(BThreadPool* const pool,
+                                                      ThreadWorkerPtr self) noexcept {
   self->func_ = ThreadWorkerFunctor{pool, self.get()};
   self->thread_ = std::thread(std::move(self->func_));
   auto tid = self->thread_.get_id();

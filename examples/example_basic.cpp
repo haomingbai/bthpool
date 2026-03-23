@@ -5,7 +5,7 @@
 #include <iostream>
 
 int main() {
-  bthpool::BThreadPool pool;
+  bthpool::BThreadPool<> pool;
 
   pool.post([] { std::cout << "hello from worker" << std::endl; });
 
