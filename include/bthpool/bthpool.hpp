@@ -45,7 +45,6 @@
 #include <algorithm>
 #include <atomic>
 #include <cassert>
-#include <concepts>
 #include <condition_variable>
 #include <cstddef>
 #include <deque>
@@ -71,20 +70,28 @@ struct BThreadPoolParam {
   std::size_t suspend_time{1};
 };
 
-template <typename Allocator>
-concept ThreadPoolAllocator = requires(Allocator alloc) {
-  typename std::allocator_traits<Allocator>::value_type;
-  typename std::allocator_traits<Allocator>::template rebind_alloc<std::byte>;
-  { Allocator(alloc) };
-} && std::copy_constructible<Allocator> && std::default_initializable<Allocator>;
+template <typename Allocator, typename = void>
+struct is_thread_pool_allocator : std::false_type {};
 
-template <ThreadPoolAllocator Allocator = std::allocator<std::byte>>
+template <typename Allocator>
+struct is_thread_pool_allocator<
+    Allocator,
+    std::void_t<typename std::allocator_traits<Allocator>::value_type,
+                typename std::allocator_traits<Allocator>::template rebind_alloc<std::byte>>>
+    : std::bool_constant<std::is_copy_constructible_v<Allocator> &&
+                         std::is_default_constructible_v<Allocator>> {};
+
+template <typename Allocator = std::allocator<std::byte>>
 class BThreadPool
 #ifdef USE_BOOST_ASIO_EXECUTOR
     : public boost::asio::execution_context
 #endif
 {
  private:
+  static_assert(
+      is_thread_pool_allocator<Allocator>::value,
+      "Allocator must satisfy allocator_traits and be copy/default constructible.");
+
   class ThreadWorker;
   using allocator_type = Allocator;
 
@@ -1003,7 +1010,7 @@ class BThreadPool
   static inline thread_local BThreadPool* current_pool_;
 };
 
-template <ThreadPoolAllocator Allocator>
+template <typename Allocator>
 inline void BThreadPool<Allocator>::ThreadWorkerDeleter::operator()(ThreadWorker* ptr) const noexcept {
   if (!ptr) {
     return;
@@ -1013,7 +1020,7 @@ inline void BThreadPool<Allocator>::ThreadWorkerDeleter::operator()(ThreadWorker
   RebindAllocatorTraits<ThreadWorker>::deallocate(alloc, ptr, 1);
 }
 
-template <ThreadPoolAllocator Allocator>
+template <typename Allocator>
 inline typename BThreadPool<Allocator>::ThreadWorkerPtr BThreadPool<Allocator>::make_thread_worker() {
   RebindAllocator<ThreadWorker> alloc(allocator_);
   auto* ptr = RebindAllocatorTraits<ThreadWorker>::allocate(alloc, 1);
@@ -1026,7 +1033,7 @@ inline typename BThreadPool<Allocator>::ThreadWorkerPtr BThreadPool<Allocator>::
   return ThreadWorkerPtr(ptr, ThreadWorkerDeleter{allocator_});
 }
 
-template <ThreadPoolAllocator Allocator>
+template <typename Allocator>
 inline void BThreadPool<Allocator>::ThreadWorker::run(BThreadPool* const pool,
                                                       ThreadWorkerPtr self) noexcept {
   self->func_ = ThreadWorkerFunctor{pool, self.get()};
