@@ -980,7 +980,7 @@ class BThreadPool
   };
 
   // Parameter of the thread pool.
-  BThreadPoolParam param_;
+  const BThreadPoolParam param_;
   allocator_type allocator_;
 
   // Task queues, including a fast queue and a slow queue.
