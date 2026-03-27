@@ -45,7 +45,6 @@
 #include <algorithm>
 #include <atomic>
 #include <cassert>
-#include <condition_variable>
 #include <cstddef>
 #include <deque>
 #include <functional>
@@ -53,10 +52,12 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <semaphore>
 #include <thread>
 #include <type_traits>
 #include <unordered_map>
 #include <utility>
+#include <vector>
 
 #include "internal/safe_queue.hpp"
 
@@ -211,6 +212,7 @@ class BThreadPool
         allocator_(std::move(alloc)),
         slow_queue_(SlowQueueContainer{RebindAllocator<ThreadFuncPtr>(allocator_)}),
         fast_queue_(param_.fast_queue_capacity, RebindAllocator<ThreadFuncPtr>(allocator_)),
+        task_counter_(0),
         thread_map_(0, std::hash<std::thread::id>{}, std::equal_to<std::thread::id>{},
                     ThreadMapAllocator(allocator_)),
         stat_(RUNNING),
@@ -496,17 +498,35 @@ class BThreadPool
    * tasks.
    */
   void join() {
-    stat_.store(STOPPING);
+    stat_.store(STOPPING, std::memory_order_release);
+
+    std::vector<ThreadWorkerPtr> workers;
     {
       std::lock_guard<std::mutex> lock(map_mtx_);
-      cv_.notify_all();
-      std::for_each(thread_map_.begin(), thread_map_.end(), [](auto& p) mutable {
-        p.second->set_stop();
-        p.second->join();
-      });
+      workers.reserve(thread_map_.size());
+      for (auto& [_, worker] : thread_map_) {
+        if (worker) {
+          worker->set_stop();
+          workers.emplace_back(std::move(worker));
+        }
+      }
       thread_map_.clear();
     }
-    stat_.store(STOPPED);
+
+    if (!workers.empty()) {
+      task_counter_.release(static_cast<std::ptrdiff_t>(workers.size()));
+    }
+
+    for (auto& worker : workers) {
+      if (worker) {
+        worker->join();
+      }
+    }
+
+    living_thread_num_.store(0, std::memory_order_release);
+    while (task_counter_.try_acquire()) {
+    }
+    stat_.store(STOPPED, std::memory_order_release);
   }
 
   /**
@@ -528,7 +548,7 @@ class BThreadPool
    * invoking this.
    */
   void shutdown() {
-    stat_.store(STOPPED);
+    stat_.store(STOPPED, std::memory_order_release);
     // Clean the queues and release resources.
     ThreadFuncPtr func_ptr;
     while (fast_queue_.pop(func_ptr)) {
@@ -537,14 +557,32 @@ class BThreadPool
     while (slow_queue_.pop(func_ptr)) {
       destroy_thread_func(func_ptr);
     }
+
+    std::vector<ThreadWorkerPtr> workers;
     {
       std::lock_guard<std::mutex> lock(map_mtx_);
-      cv_.notify_all();
-      std::for_each(thread_map_.begin(), thread_map_.end(), [](auto& p) mutable {
-        p.second->set_stop();
-        p.second->join();
-      });
+      workers.reserve(thread_map_.size());
+      for (auto& [_, worker] : thread_map_) {
+        if (worker) {
+          worker->set_stop();
+          workers.emplace_back(std::move(worker));
+        }
+      }
       thread_map_.clear();
+    }
+
+    if (!workers.empty()) {
+      task_counter_.release(static_cast<std::ptrdiff_t>(workers.size()));
+    }
+
+    for (auto& worker : workers) {
+      if (worker) {
+        worker->join();
+      }
+    }
+
+    living_thread_num_.store(0, std::memory_order_release);
+    while (task_counter_.try_acquire()) {
     }
   }
 
@@ -787,7 +825,7 @@ class BThreadPool
     }
     // Push the task to the queue.
     if (fast_queue_.push(func_ptr)) {
-      cv_.notify_one();
+      task_counter_.release();
       return;
     } else {
       curr_num = living_thread_num_.load(std::memory_order_acquire);
@@ -805,7 +843,7 @@ class BThreadPool
       }
       // Push the task into the slow queue to wait.
       slow_queue_.push(func_ptr);
-      cv_.notify_one();
+      task_counter_.release();
       return;
     }
   }
@@ -826,7 +864,7 @@ class BThreadPool
     }
     // Push the task into the slow queue to wait directly.
     slow_queue_.push(func_ptr);
-    cv_.notify_one();
+    task_counter_.release();
   }
 
   class ThreadWorker {
@@ -870,7 +908,7 @@ class BThreadPool
   class ThreadWorkerFunctor {
    public:
     explicit ThreadWorkerFunctor(BThreadPool* const pool, ThreadWorker* worker)
-        : pool_(pool), worker_(worker), curr_unscanned_time_(0) {}
+        : pool_(pool), worker_(worker) {}
 
     void operator()() noexcept {
       // Set some runtime status, to mark that
@@ -879,41 +917,30 @@ class BThreadPool
       pool_->current_pool_ = pool_;
 
       for (;;) {
-        if (pool_->stat_.load(std::memory_order_acquire) == STOPPED && worker_->should_stop()) {
-          // Normal exit, no nead to clean because in the join function,
-          // all threads are auto joinned.
+        if (!pool_->task_counter_.try_acquire()) {
+          if (try_cleanup()) {
+            break;
+          }
+          pool_->task_counter_.acquire();
+        }
+
+        ThreadFuncPtr func = nullptr;
+        while (!func) {
+          func = try_get_task();
+          if (func) {
+            break;
+          }
+          auto status = pool_->stat_.load(std::memory_order_acquire);
+          if (status != RUNNING || worker_->should_stop()) {
+            break;
+          }
+          std::this_thread::yield();
+        }
+
+        if (!func) {
           break;
         }
-        // Determine whether the pool should scan from the slow queue.
-        if (curr_unscanned_time_ >= pool_->param_.thread_clean_interval) {
-          // Pop a task from the slow queue.
-          ThreadFuncPtr func;
-          if (pool_->slow_queue_.pop(func)) {
-            execute_and_delete_function(func);
-          }
-          // Mark the slow queue as scanned.
-          curr_unscanned_time_ = 0;
-        }
-        // Get the task from fast queue.
-        ThreadFuncPtr func = try_get_task();
-        if (func) {
-          execute_and_delete_function(func);
-        } else {
-          // If the thread pool needs joinning,
-          // then exit.
-          if (pool_->stat_.load(std::memory_order_acquire) == STOPPING) {
-            // Normal exit, no need to clean because in the join function,
-            // all threads are auto joinned.
-            break;
-          }
-          if (try_cleanup()) {
-            // If cleaned by a cleaner, than the thread should be joinned.
-            break;
-          }
-          // Sleep for a while to wait for a new task.
-          std::unique_lock<std::mutex> lock(pool_->mtx_);
-          pool_->cv_.wait(lock);
-        }
+        execute_and_delete_function(func);
       }
     }
 
@@ -937,8 +964,6 @@ class BThreadPool
       if (succ) {
         return func;
       } else if ((succ = pool_->slow_queue_.pop(func))) {
-        // Reset the scanner task of the slow queue.
-        curr_unscanned_time_ = 0;
         return func;
       }
       return nullptr;
@@ -982,8 +1007,6 @@ class BThreadPool
     }
 
     ThreadWorker* const worker_;
-    // Determine the behavior of the thread pool.
-    std::size_t curr_unscanned_time_;
     // Temperory sotre the pointer of the thread pool.
     BThreadPool* const pool_;
   };
@@ -995,14 +1018,11 @@ class BThreadPool
   // Task queues, including a fast queue and a slow queue.
   SlowQueueType slow_queue_;
   FastQueueType fast_queue_;
+  std::counting_semaphore<> task_counter_;
 
   // Thread map, which can find the thread worker and clean.
   std::mutex map_mtx_;
   ThreadMapType thread_map_;
-
-  // Lock and conditional variable
-  std::condition_variable cv_;
-  std::mutex mtx_;
 
   // Determine whether the pool should stop.
   enum Status : unsigned char { RUNNING, STOPPING, STOPPED };

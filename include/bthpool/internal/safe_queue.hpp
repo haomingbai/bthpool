@@ -177,9 +177,7 @@ class LockfreeFixedQueue {
     QueueNode* node = nullptr;
     // Get the tail to be inserted.
     auto tail = std::atomic_load_explicit(&tail_, std::memory_order_acquire);
-    // Define whether the tail has been occupied.
-    bool succ = false;
-    for (std::size_t i = 0; i < kMaxSpinTime; i++) {
+    while (true) {
       // The node to be acquired.
       node = &data_[tail & mask_];
       // If the node's tail is not the expected tail,
@@ -194,19 +192,14 @@ class LockfreeFixedQueue {
               std::memory_order_acq_rel,  // success
               std::memory_order_relaxed   // failure (expected updated)
               )) {
-        succ = true;
         break;
       }
     }
-    if (succ) {
-      node->construct_data(elem);
-      // Store the new head of the node,
-      // which will be checked while the the node is consumed.
-      std::atomic_store_explicit(&node->head_, tail, std::memory_order_release);
-      return true;
-    } else {
-      return false;
-    }
+    node->construct_data(elem);
+    // Store the new head of the node,
+    // which will be checked while the the node is consumed.
+    std::atomic_store_explicit(&node->head_, tail, std::memory_order_release);
+    return true;
   }
 
   bool push(T&& elem) noexcept {
@@ -214,9 +207,7 @@ class LockfreeFixedQueue {
     QueueNode* node = nullptr;
     // Get the tail to be inserted.
     auto tail = std::atomic_load_explicit(&tail_, std::memory_order_acquire);
-    // Define whether the tail has been occupied.
-    bool succ = false;
-    for (std::size_t i = 0; i < kMaxSpinTime; i++) {
+    while (true) {
       // The node to be acquired.
       node = &data_[tail & mask_];
       // If the node's tail is not the expected tail,
@@ -231,19 +222,14 @@ class LockfreeFixedQueue {
               std::memory_order_acq_rel,  // success
               std::memory_order_relaxed   // failure (expected updated)
               )) {
-        succ = true;
         break;
       }
     }
-    if (succ) {
-      node->construct_data(std::move(elem));
-      // Store the new head of the node,
-      // which will be checked while the the node is consumed.
-      std::atomic_store_explicit(&node->head_, tail, std::memory_order_release);
-      return true;
-    } else {
-      return false;
-    }
+    node->construct_data(std::move(elem));
+    // Store the new head of the node,
+    // which will be checked while the the node is consumed.
+    std::atomic_store_explicit(&node->head_, tail, std::memory_order_release);
+    return true;
   }
 
   template <typename... Args>
@@ -252,9 +238,7 @@ class LockfreeFixedQueue {
     QueueNode* node = nullptr;
     // Get the tail to be inserted.
     auto tail = std::atomic_load_explicit(&tail_, std::memory_order_acquire);
-    // Define whether the tail has been occupied.
-    bool succ = false;
-    for (std::size_t i = 0; i < kMaxSpinTime; i++) {
+    while (true) {
       // The node to be acquired.
       node = &data_[tail & mask_];
       // If the node's tail is not the expected tail,
@@ -269,19 +253,14 @@ class LockfreeFixedQueue {
               std::memory_order_acq_rel,  // success
               std::memory_order_relaxed   // failure (expected updated)
               )) {
-        succ = true;
         break;
       }
     }
-    if (succ) {
-      node->construct_data(std::forward<Args>(args)...);
-      // Store the new head of the node,
-      // which will be checked while the the node is consumed.
-      std::atomic_store_explicit(&node->head_, tail, std::memory_order_release);
-      return true;
-    } else {
-      return false;
-    }
+    node->construct_data(std::forward<Args>(args)...);
+    // Store the new head of the node,
+    // which will be checked while the the node is consumed.
+    std::atomic_store_explicit(&node->head_, tail, std::memory_order_release);
+    return true;
   }
 
   bool pop(T& elem) noexcept {
@@ -289,9 +268,7 @@ class LockfreeFixedQueue {
     QueueNode* node = nullptr;
     // Get the head of the queue.
     auto head = std::atomic_load_explicit(&head_, std::memory_order_acquire);
-    // Define whether the spin operation succeed.
-    bool succ = false;
-    for (std::size_t i = 0; i < kMaxSpinTime; i++) {
+    while (true) {
       // The node to be acquired.
       node = &data_[head & mask_];
       // If the node's head is not the expected tail,
@@ -302,17 +279,12 @@ class LockfreeFixedQueue {
       // The node is valid, try to occupy the node.
       if (std::atomic_compare_exchange_weak_explicit(
               &head_, &head, head + 1, std::memory_order_acq_rel, std::memory_order_relaxed)) {
-        succ = true;
         break;
       }
     }
-    if (succ) {
-      elem = std::move(*(node->data_ptr()));
-      std::atomic_store_explicit(&node->tail_, head + capacity_, std::memory_order_release);
-      return true;
-    } else {
-      return false;
-    }
+    elem = std::move(*(node->data_ptr()));
+    std::atomic_store_explicit(&node->tail_, head + capacity_, std::memory_order_release);
+    return true;
   }
 
   size_t size() const noexcept {
@@ -332,9 +304,6 @@ class LockfreeFixedQueue {
   static constexpr std::size_t kFallbackCapacity = 1 << 10;
   static constexpr std::size_t kMaxCapacity =
       static_cast<size_t>(std::numeric_limits<unsigned int>::max()) + 1;
-
-  // The maxium try number of the queue.
-  static constexpr std::size_t kMaxSpinTime = 1 << 10;
 
   static inline std::size_t generate_actual_capacity(std::size_t capacity) {
     // The queue should have a capacity of at least 2.
