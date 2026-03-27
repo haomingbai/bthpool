@@ -742,6 +742,12 @@ class BThreadPool
   }
 
  private:
+  size_t effective_core_thread_num() const noexcept {
+    // Keep one always-available worker even when core_thread_num is configured
+    // as 0, so queued tasks can still make forward progress.
+    return param_.core_thread_num == 0 ? 1 : param_.core_thread_num;
+  }
+
   template <typename Fn>
   ThreadFuncPtr make_thread_func(Fn&& fn) {
     ThreadFuncAllocator alloc(allocator_);
@@ -767,8 +773,9 @@ class BThreadPool
   ThreadWorkerPtr make_thread_worker();
 
   void post(ThreadFuncPtr func_ptr) {
+    const auto effective_core = effective_core_thread_num();
     auto curr_num = living_thread_num_.load(std::memory_order_acquire);
-    while (curr_num < param_.core_thread_num) {
+    while (curr_num < effective_core) {
       if (living_thread_num_.compare_exchange_weak(
               curr_num, curr_num + 1, std::memory_order_acq_rel, std::memory_order_acquire)) {
         // Get the lock.
@@ -804,9 +811,10 @@ class BThreadPool
   }
 
   void defer(ThreadFuncPtr func_ptr) {
+    const auto effective_core = effective_core_thread_num();
     // If the thread is less than expected, then create a new one.
     auto curr_num = living_thread_num_.load(std::memory_order_acquire);
-    while (curr_num < param_.core_thread_num) {
+    while (curr_num < effective_core) {
       if (living_thread_num_.compare_exchange_weak(
               curr_num, curr_num + 1, std::memory_order_acq_rel, std::memory_order_acquire)) {
         // Get the lock.
@@ -940,8 +948,9 @@ class BThreadPool
       if (pool_->stat_.load(std::memory_order_acquire) != RUNNING) {
         return true;
       }
+      const auto effective_core = pool_->effective_core_thread_num();
       std::ptrdiff_t curr_num = pool_->living_thread_num_.load(std::memory_order_acquire);
-      while (curr_num > pool_->param_.core_thread_num) {
+      while (curr_num > effective_core) {
         if (pool_->living_thread_num_.compare_exchange_weak(
                 curr_num, curr_num - 1, std::memory_order_acq_rel, std::memory_order_acquire)) {
           // Successfully get the lock.

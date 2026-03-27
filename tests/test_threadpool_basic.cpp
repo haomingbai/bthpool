@@ -113,3 +113,37 @@ TEST(ThreadPoolBasic, ConcurrentSubmitStability) {
   EXPECT_EQ(done.load(std::memory_order_relaxed),
             submit_threads * per_thread_tasks);
 }
+
+TEST(ThreadPoolBasic, FastQueueCapacityZeroStillExecutesTasks) {
+  bthpool::BThreadPoolParam param;
+  param.core_thread_num = 2;
+  param.max_thread_num = 2;
+  param.fast_queue_capacity = 0;
+  bthpool::BThreadPool<> pool(param);
+
+  constexpr int kTaskCount = 200;
+  std::atomic<int> done{0};
+  for (int i = 0; i < kTaskCount; ++i) {
+    pool.post([&done] { done.fetch_add(1, std::memory_order_relaxed); });
+  }
+
+  pool.join();
+  EXPECT_EQ(done.load(std::memory_order_relaxed), kTaskCount);
+}
+
+TEST(ThreadPoolBasic, CoreZeroAndFastQueueZeroStillMakesProgress) {
+  bthpool::BThreadPoolParam param;
+  param.core_thread_num = 0;
+  param.max_thread_num = 1;
+  param.fast_queue_capacity = 0;
+  bthpool::BThreadPool<> pool(param);
+
+  constexpr int kTaskCount = 4;
+  std::atomic<int> done{0};
+  for (int i = 0; i < kTaskCount; ++i) {
+    pool.post([&done] { done.fetch_add(1, std::memory_order_relaxed); });
+  }
+
+  pool.join();
+  EXPECT_EQ(done.load(std::memory_order_relaxed), kTaskCount);
+}
