@@ -10,19 +10,12 @@
 //    If your queue lives elsewhere, update the aliases below.
 // 4) LockfreeFixedQueue<T> requires T to be trivially destructible and
 //    nothrow-constructible; tests use uint64_t.
-// 5) Concurrency stress level can be configured via environment variables:
-//    - STRESS_SECS (default 3)
-//    - STRESS_OPS  (default 500000)
-//    - STRESS_THREADS (default min(hardware_concurrency, 8))
-//    Random seed is fixed for reproducibility.
 
 #pragma once
 
 #include <atomic>
 #include <cstdint>
-#include <cstdlib>
 #include <limits>
-#include <thread>
 #include <utility>
 
 #include "bthpool/bthpool.hpp"
@@ -50,38 +43,6 @@ constexpr bool has_futured_post() {
 }  // namespace test_adapter
 
 namespace test_util {
-struct StressConfig {
-  int secs;
-  int ops;
-  int threads;
-  uint64_t seed;
-};
-
-inline int getenv_int(const char* name, int def_val) {
-  if (const char* val = std::getenv(name); val && *val) {
-    char* end = nullptr;
-    long v = std::strtol(val, &end, 10);
-    if (end != val && v > 0 && v < std::numeric_limits<int>::max()) {
-      return static_cast<int>(v);
-    }
-  }
-  return def_val;
-}
-
-inline StressConfig get_stress_config() {
-  int hw = static_cast<int>(std::thread::hardware_concurrency());
-  if (hw <= 0) {
-    hw = 4;
-  }
-  int def_threads = (hw < 8) ? hw : 8;
-  StressConfig cfg;
-  cfg.secs = getenv_int("STRESS_SECS", 3);
-  cfg.ops = getenv_int("STRESS_OPS", 500000);
-  cfg.threads = getenv_int("STRESS_THREADS", def_threads);
-  cfg.seed = 0xC0FFEEu;
-  return cfg;
-}
-
 struct DuplicateInfo {
   std::atomic<uint64_t> count{0};
   std::atomic<uint64_t> first_id{std::numeric_limits<uint64_t>::max()};
