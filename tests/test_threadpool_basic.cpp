@@ -147,3 +147,51 @@ TEST(ThreadPoolBasic, CoreZeroAndFastQueueZeroStillMakesProgress) {
   pool.join();
   EXPECT_EQ(done.load(std::memory_order_relaxed), kTaskCount);
 }
+
+TEST(ThreadPoolBasic, PostAfterJoinIsSilentlyDropped) {
+  auto pool = test_adapter::make_pool(1);
+  pool.join();
+
+  std::atomic<int> ran{0};
+  pool.post([&ran] { ran.fetch_add(1, std::memory_order_relaxed); });
+  std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  EXPECT_EQ(ran.load(std::memory_order_relaxed), 0);
+}
+
+TEST(ThreadPoolBasic, FuturedPostAfterJoinReturnsReadyExceptionalFuture) {
+  auto pool = test_adapter::make_pool(1);
+  pool.join();
+
+  auto fut = pool.futured_post([] { return 42; });
+  EXPECT_EQ(fut.wait_for(std::chrono::milliseconds(0)), std::future_status::ready);
+  EXPECT_THROW({ (void)fut.get(); }, std::runtime_error);
+}
+
+TEST(ThreadPoolBasic, StressFastQueueZeroRepeatedJoinAndFuture) {
+  constexpr int kRounds = 1000;
+  constexpr int kTasksPerRound = 200;
+
+  for (int round = 0; round < kRounds; ++round) {
+    bthpool::BThreadPoolParam param;
+    param.core_thread_num = 1;
+    param.max_thread_num = 64;
+    param.fast_queue_capacity = 0;
+
+    bthpool::BThreadPool<> pool(param);
+    std::atomic<int> done{0};
+
+    for (int i = 0; i < kTasksPerRound; ++i) {
+      pool.post([&done] { done.fetch_add(1, std::memory_order_relaxed); });
+    }
+
+    auto future = pool.futured_post([&done] {
+      done.fetch_add(1, std::memory_order_relaxed);
+      return 42;
+    });
+
+    pool.join();
+    ASSERT_EQ(done.load(std::memory_order_relaxed), kTasksPerRound + 1)
+        << "round=" << round;
+    ASSERT_EQ(future.get(), 42) << "round=" << round;
+  }
+}
