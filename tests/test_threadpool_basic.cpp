@@ -114,6 +114,34 @@ TEST(ThreadPoolBasic, ConcurrentSubmitStability) {
             submit_threads * per_thread_tasks);
 }
 
+TEST(ThreadPoolBasic, RepeatedGrowAndIdleCleanupStillExecutesAllTasks) {
+  using namespace std::chrono_literals;
+
+  bthpool::BThreadPoolParam param;
+  param.core_thread_num = 1;
+  param.max_thread_num = 4;
+  param.fast_queue_capacity = 0;
+  param.thread_clean_interval = 1;
+  bthpool::BThreadPool<> pool(param);
+
+  std::atomic<int> done{0};
+  constexpr int kRounds = 40;
+  constexpr int kTasksPerRound = 12;
+
+  for (int round = 0; round < kRounds; ++round) {
+    for (int i = 0; i < kTasksPerRound; ++i) {
+      pool.post([&done] {
+        std::this_thread::sleep_for(1ms);
+        done.fetch_add(1, std::memory_order_relaxed);
+      });
+    }
+    std::this_thread::sleep_for(5ms);
+  }
+
+  pool.join();
+  EXPECT_EQ(done.load(std::memory_order_relaxed), kRounds * kTasksPerRound);
+}
+
 TEST(ThreadPoolBasic, FastQueueCapacityZeroStillExecutesTasks) {
   bthpool::BThreadPoolParam param;
   param.core_thread_num = 2;
@@ -165,6 +193,30 @@ TEST(ThreadPoolBasic, FuturedPostAfterJoinReturnsReadyExceptionalFuture) {
   auto fut = pool.futured_post([] { return 42; });
   EXPECT_EQ(fut.wait_for(std::chrono::milliseconds(0)), std::future_status::ready);
   EXPECT_THROW({ (void)fut.get(); }, std::runtime_error);
+}
+
+TEST(ThreadPoolBasic, ShutdownMakesQueuedFutureReady) {
+  using namespace std::chrono_literals;
+
+  bthpool::BThreadPoolParam param;
+  param.core_thread_num = 1;
+  param.max_thread_num = 1;
+  param.fast_queue_capacity = 0;
+  bthpool::BThreadPool<> pool(param);
+
+  std::promise<void> release_running_task;
+  auto release_future = release_running_task.get_future();
+
+  pool.post([&release_future] { release_future.wait(); });
+  auto queued = pool.futured_post([] { return 42; });
+
+  auto shutdown_future = std::async(std::launch::async, [&pool] { pool.shutdown(); });
+  std::this_thread::sleep_for(10ms);
+  release_running_task.set_value();
+
+  EXPECT_EQ(shutdown_future.wait_for(2s), std::future_status::ready);
+  EXPECT_EQ(queued.wait_for(0ms), std::future_status::ready);
+  EXPECT_THROW({ (void)queued.get(); }, std::future_error);
 }
 
 TEST(ThreadPoolBasic, StressFastQueueZeroRepeatedJoinAndFuture) {

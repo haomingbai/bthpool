@@ -78,27 +78,224 @@ pool.post([] { /* do work without a return value */ });
 - `post` and `defer` discard return values; use `futured_post` to observe results or exceptions.
 - `dispatch` may run inline when called from a pool worker, which can reduce scheduling overhead.
 
-## Design Highlights
+## Design Document
 
-## Threading Model
+This section documents the current implementation, with emphasis on the two
+things that matter most for correctness:
 
-The pool auto-sizes workers with a model similar to Java's `ThreadPoolExecutor`:
+1. the order of lifecycle and bookkeeping operations
+2. the observable behavior of the pool in each state
 
-- **Core size**: Defaults to `std::thread::hardware_concurrency()` (may be `0` on some platforms).
-- **Max size**: Defaults to effectively unbounded (`param.max_thread_num` set to `INT_MAX`).
-- **Fast vs slow queues**: Tasks are first pushed to a lock-free fast queue; if saturated, a worker is spawned up to max size, and the task falls back to the slow queue.
-- **Grow on demand**: When posting, if `living_thread_num < core_thread_num`, workers are created immediately. If the fast queue is full and all core threads are busy, the pool can create additional threads up to `max_thread_num`.
-- **Shrink when idle**: Idle workers opportunistically clean themselves up to return to the core size. Threads above `core_thread_num` decrement `living_thread_num` and schedule a cleaner to stop and join the worker.
-- **Blocking strategy**: Workers wait on a condition variable and wake on new tasks or shutdown.
-- **Shutdown semantics**: `join()` transitions to STOPPING and waits for workers to finish; `shutdown()` transitions to STOPPED and stops without draining.
+### Design Goals
 
-In practice:
+- Keep the public API unchanged: `post`, `defer`, `dispatch`, `futured_post`, `join`, `shutdown`, `restart`, and executor compatibility all remain.
+- Keep the dual-queue model: `post` prefers the fast queue and falls back to the slow queue; `defer` always uses the slow queue.
+- Keep adaptive sizing: the pool grows toward `max_thread_num` under pressure and shrinks back toward `core_thread_num` when idle.
+- Prioritize determinism over a partially lock-free lifecycle: queue visibility, worker sleep/wake, and stop-state transitions are serialized by one mutex/condition-variable pair.
 
-- Under light load, the pool maintains ~core threads.
-- Under pressure, it tries the fast queue first, then grows threads and uses the slow queue to absorb bursty tasks.
-- When load subsides, excess workers are cleaned and the pool returns to core size.
+### State Model
 
-Source references: see `include/bthpool/bthpool.hpp` — `BThreadPoolParam` (core/max), `post()` (growth), `ThreadWorkerFunctor::try_cleanup()` (shrink), and the two queues in the private state.
+The pool has four states:
+
+- `RUNNING`: accepts new tasks; workers execute tasks and may grow/shrink.
+- `JOINING`: rejects new tasks; workers continue draining already accepted work.
+- `STOPPING`: rejects new tasks; queued work is gone, workers only need to finish in-flight work and exit.
+- `STOPPED`: fully quiesced; `restart()` may move the pool back to `RUNNING`.
+
+```mermaid
+stateDiagram-v2
+    [*] --> RUNNING
+    RUNNING --> JOINING: join()
+    RUNNING --> STOPPING: shutdown()
+    JOINING --> STOPPING: pending_task_num_ == 0
+    STOPPING --> STOPPED: all workers joined
+    STOPPED --> RUNNING: restart()
+```
+
+### Core Data Model
+
+- `state_mtx_` and `state_cv_` are the single source of truth for queue state, worker counts, and lifecycle state.
+- `pending_task_num_` counts all accepted tasks that still exist in the system, including queued work and currently running work.
+- `fast_queue_size_` and `slow_queue_size_` track visible queued work; they are updated under `state_mtx_`.
+- `workers_` owns every worker object before the corresponding `std::thread` starts, and keeps ownership until a non-worker thread reaps or joins that worker.
+
+This is the key design change relative to the older implementation: semaphore
+permits, pending counters, and worker ownership are no longer advanced by
+independent protocols.
+
+### Submission Order
+
+The submission path is intentionally ordered as follows:
+
+1. Reap exited workers from earlier shrink/stop events.
+2. Lock `state_mtx_`.
+3. Reject the task if the pool is no longer `RUNNING`.
+4. Decide whether to start a worker before accepting the task.
+5. Increment `pending_task_num_`.
+6. Push into the fast queue if possible, otherwise fall back to the slow queue.
+7. `notify_one()` to wake exactly one sleeper.
+
+That order matters:
+
+- Starting a worker before accepting the task avoids the “task counted, but no worker can ever run it” failure mode if thread creation throws.
+- Incrementing `pending_task_num_` before releasing the lock guarantees that `join()` sees every accepted task.
+- Queue insertion and wake-up are performed under the same mutex-protected state, which removes the lost-notification and lost-permit windows that previously caused CI hangs.
+
+```mermaid
+sequenceDiagram
+    participant Producer
+    participant Pool as Pool(state_mtx_)
+    participant Worker
+
+    Producer->>Pool: reap_exited_workers()
+    Producer->>Pool: lock state_mtx_
+    Pool->>Pool: reject if state != RUNNING
+    Pool->>Pool: maybe start_worker_locked()
+    Pool->>Pool: pending_task_num_++
+    alt fast queue available
+        Pool->>Pool: fast_queue.push()
+    else fallback
+        Pool->>Pool: slow_queue.push()
+    end
+    Pool-->>Worker: state_cv_.notify_one()
+    Pool-->>Producer: unlock and return
+```
+
+### Worker Behavior
+
+Workers always observe state under `state_mtx_` before choosing a behavior:
+
+- If visible queued work exists, pop one task and execute it outside the lock.
+- If the pool is `STOPPING`, mark the worker exited and return.
+- If the pool is `JOINING`, do not accept new work; either drain already queued work or sleep until `pending_task_num_ == 0`.
+- If the pool is `RUNNING` and the pool is above core size, perform a timed wait and retire on timeout.
+- If the pool is `RUNNING` and the pool is at core size, wait indefinitely for work or a lifecycle transition.
+
+```mermaid
+flowchart TD
+    A["lock state_mtx_"] --> B{"queued task visible?"}
+    B -- "yes" --> C["pop task"]
+    C --> D["unlock and execute task"]
+    D --> E["lock state_mtx_"]
+    E --> F["pending_task_num_--"]
+    F --> G{"stopping or last task?"}
+    G -- "yes" --> H["notify_all()"]
+    G -- "no" --> A
+    H --> A
+
+    B -- "no" --> I{"state"}
+    I -- "STOPPING" --> J["mark worker exited and return"]
+    I -- "JOINING and pending == 0" --> J
+    I -- "JOINING and pending > 0" --> K["wait until queued task or pending == 0"]
+    K --> A
+    I -- "RUNNING and above core" --> L["timed wait"]
+    L --> M{"timed out and still above core?"}
+    M -- "yes" --> J
+    M -- "no" --> A
+    I -- "RUNNING and at core" --> N["wait indefinitely"]
+    N --> A
+```
+
+### Lifecycle Order
+
+#### `join()`
+
+`join()` is graceful shutdown. Its order is:
+
+1. Reap previously exited workers.
+2. Serialize with other lifecycle methods via `lifecycle_mtx_`.
+3. Under `state_mtx_`, move the pool from `RUNNING` to `JOINING`.
+4. Wait until `pending_task_num_ == 0`.
+5. Move the pool from `JOINING` to `STOPPING`.
+6. Move all worker ownership out of `workers_`.
+7. Join those workers outside `state_mtx_`.
+8. Re-enter `state_mtx_` and mark the pool `STOPPED`.
+
+The critical ordering rule is step 4 before step 6. If worker ownership were
+moved out before the accepted-task count reached zero, a worker could still be
+finishing its last task while the owner thread is already dismantling the
+container that tracks it.
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant Pool as Pool(state_mtx_)
+    participant Worker
+
+    User->>Pool: join()
+    Pool->>Pool: state = JOINING
+    Pool->>Worker: notify_all()
+    Worker->>Pool: drain remaining accepted work
+    Worker->>Pool: pending_task_num_ becomes 0
+    Pool->>Pool: state = STOPPING
+    Pool->>Pool: move workers_ out
+    Pool->>Worker: join outside state_mtx_
+    Pool->>Pool: state = STOPPED
+```
+
+#### `shutdown()`
+
+`shutdown()` is immediate stop. Its order is:
+
+1. Reap previously exited workers.
+2. Serialize with other lifecycle methods via `lifecycle_mtx_`.
+3. Under `state_mtx_`, move the pool to `STOPPING`.
+4. Drop queued-but-not-running work while still holding `state_mtx_`.
+5. Wake all workers.
+6. Move all worker ownership out of `workers_`.
+7. Join those workers outside `state_mtx_`.
+8. Re-enter `state_mtx_` and mark the pool `STOPPED`.
+
+The critical ordering rule is step 3 before step 4. Once `STOPPING` is visible,
+no new work can be accepted, so clearing queues cannot race with a producer
+still claiming success on a just-submitted task.
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant Pool as Pool(state_mtx_)
+    participant Worker
+
+    User->>Pool: shutdown()
+    Pool->>Pool: state = STOPPING
+    Pool->>Pool: clear queued tasks
+    Pool->>Worker: notify_all()
+    Worker->>Pool: finish in-flight task if any
+    Worker->>Pool: mark exited
+    Pool->>Pool: move workers_ out
+    Pool->>Worker: join outside state_mtx_
+    Pool->>Pool: state = STOPPED
+```
+
+### Behavior Summary
+
+- `fast_queue_capacity == 0`: fast queue is disabled; `post()` goes straight to the slow queue, but forward progress is still guaranteed.
+- `core_thread_num == 0`: the implementation still keeps an effective minimum of one worker, because otherwise accepted work could never make progress.
+- `post()` after `join()`: silently dropped, matching existing tests.
+- `futured_post()` after `join()`: returns a ready exceptional future, matching existing tests.
+- `shutdown()` on queued futures: queued task wrappers are destroyed before execution; their promises therefore become ready with failure instead of hanging forever.
+- `restart()`: only transitions `STOPPED -> RUNNING`; workers are recreated lazily by the next accepted submission.
+
+### Why The New Design Fixes The Old Deadlocks
+
+The previous failures came from mixing several partially independent mechanisms:
+
+- queue visibility
+- pending-task accounting
+- worker ownership/cleanup
+- stop/join wake-ups
+
+The new design fixes that by making every ordering-sensitive transition pass
+through the same mutex and the same condition variable. That means:
+
+- an accepted task is always counted before it becomes visible to `join()`
+- a worker is always owned before it starts
+- a worker only reports “I am exited”; a non-worker thread performs the actual join
+- lifecycle state changes and queue draining cannot observe half-applied bookkeeping
+
+Source references: see `include/bthpool/bthpool.hpp` — `join()`, `shutdown()`,
+`enqueue_task()`, `worker_loop()`, and the private state block near the end of
+the class.
 
 ## Tips & FAQs
 

@@ -43,8 +43,8 @@
 #include <boost/asio/execution_context.hpp>
 #endif
 #include <algorithm>
-#include <atomic>
 #include <cassert>
+#include <chrono>
 #include <cstddef>
 #include <condition_variable>
 #include <deque>
@@ -53,11 +53,9 @@
 #include <limits>
 #include <memory>
 #include <mutex>
-#include <semaphore>
 #include <stdexcept>
 #include <thread>
 #include <type_traits>
-#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -114,11 +112,7 @@ class BThreadPool
   using SlowQueueContainer = std::deque<ThreadFuncPtr, RebindAllocator<ThreadFuncPtr>>;
   using SlowQueueType = SafeQueue<ThreadFuncPtr, SlowQueueContainer>;
   using FastQueueType = LockfreeFixedQueue<ThreadFuncPtr, RebindAllocator<ThreadFuncPtr>>;
-  using ThreadMapValueType = std::pair<const std::thread::id, ThreadWorkerPtr>;
-  using ThreadMapAllocator = RebindAllocator<ThreadMapValueType>;
-  using ThreadMapType =
-      std::unordered_map<std::thread::id, ThreadWorkerPtr, std::hash<std::thread::id>,
-                         std::equal_to<std::thread::id>, ThreadMapAllocator>;
+  using WorkerContainer = std::vector<ThreadWorkerPtr, RebindAllocator<ThreadWorkerPtr>>;
 
  public:
   using pool_allocator_type = allocator_type;
@@ -213,12 +207,13 @@ class BThreadPool
         allocator_(std::move(alloc)),
         slow_queue_(SlowQueueContainer{RebindAllocator<ThreadFuncPtr>(allocator_)}),
         fast_queue_(param_.fast_queue_capacity, RebindAllocator<ThreadFuncPtr>(allocator_)),
-        task_counter_(0),
-        thread_map_(0, std::hash<std::thread::id>{}, std::equal_to<std::thread::id>{},
-                    ThreadMapAllocator(allocator_)),
         stat_(RUNNING),
-        living_thread_num_(0),
-        pending_task_num_(0) {}
+        workers_(RebindAllocator<ThreadWorkerPtr>(allocator_)),
+        live_worker_num_(0),
+        idle_worker_num_(0),
+        pending_task_num_(0),
+        fast_queue_size_(0),
+        slow_queue_size_(0) {}
 
   /**
    * @brief Schedule a task that returns void for execution by the thread pool.
@@ -485,10 +480,9 @@ class BThreadPool
    * @brief Gracefully shuts down the thread pool by stopping worker threads and
    * waiting for all tasks to complete.
    *
-   * This function transitions the pool state to stopping, notifies all worker
-   * threads, and joins each thread. It blocks until all queued and in-progress
-   * tasks have finished executing and all threads have terminated, then marks
-   * the pool as stopped.
+   * This function transitions the pool into a draining state, waits for all
+   * accepted work to leave the system, then wakes and joins the workers before
+   * marking the pool as stopped.
    *
    * Thread Safety:
    * - This method is thread-safe; it uses internal synchronization to manage
@@ -519,56 +513,60 @@ class BThreadPool
    * tasks.
    */
   void join() {
-    stat_.store(STOPPING, std::memory_order_release);
-
-    {
-      std::unique_lock<std::mutex> lock(pending_mtx_);
-      pending_cv_.wait(lock, [this] {
-        return pending_task_num_.load(std::memory_order_acquire) == 0;
-      });
-    }
-
     std::vector<ThreadWorkerPtr> workers;
+
+    reap_exited_workers();
+
     {
       std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mtx_);
-      std::lock_guard<std::mutex> lock(map_mtx_);
-      workers.reserve(thread_map_.size());
-      for (auto& [_, worker] : thread_map_) {
+      std::unique_lock<std::mutex> lock(state_mtx_);
+      if (stat_ == STOPPED) {
+        return;
+      }
+
+      // Reason: `join()` now flips the pool into a single draining state under
+      // one mutex, so new submissions cannot race with shutdown bookkeeping.
+      // Effect: accepted tasks finish exactly once and workers observe the same
+      // stop condition instead of juggling multiple counters/semaphores.
+      stat_ = JOINING;
+      state_cv_.notify_all();
+
+      // Ordering matters here: we wait for the accepted-task count to reach
+      // zero before moving worker ownership out of `workers_`. Doing it in the
+      // opposite order would let a worker touch a destroyed/moved record while
+      // it is still finishing its last task.
+      state_cv_.wait(lock, [this] { return pending_task_num_ == 0; });
+
+      stat_ = STOPPING;
+      state_cv_.notify_all();
+      workers.reserve(workers_.size());
+      for (auto& worker : workers_) {
         if (worker) {
           workers.emplace_back(std::move(worker));
         }
       }
-      thread_map_.clear();
+      workers_.clear();
+      fast_queue_size_ = 0;
+      slow_queue_size_ = 0;
     }
 
-    for (auto& worker : workers) {
-      if (worker) {
-        worker->set_stop();
-      }
-    }
+    join_workers(workers);
 
-    if (!workers.empty()) {
-      task_counter_.release(static_cast<std::ptrdiff_t>(workers.size()));
+    {
+      std::lock_guard<std::mutex> lock(state_mtx_);
+      stat_ = STOPPED;
+      live_worker_num_ = 0;
+      idle_worker_num_ = 0;
+      state_cv_.notify_all();
     }
-
-    for (auto& worker : workers) {
-      if (worker) {
-        worker->join();
-      }
-    }
-
-    living_thread_num_.store(0, std::memory_order_release);
-    while (task_counter_.try_acquire()) {
-    }
-    stat_.store(STOPPED, std::memory_order_release);
   }
 
   /**
    * @brief Shuts down the thread pool immediately.
    *
-   * Sets the internal status to STOPPED, notifies all worker threads, and joins
-   * them. This operation does NOT wait for queued or currently running tasks to
-   * complete.
+   * Stops accepting new tasks, discards queued-but-not-running tasks, wakes all
+   * workers, and joins them. Running tasks are allowed to finish their current
+   * callable, but no further queued work is drained.
    *
    * Usage:
    *  - Call when the pool should stop accepting and executing further work.
@@ -576,76 +574,82 @@ class BThreadPool
    * submitting tasks.
    *
    * Notes:
-   *  - Pending tasks may be discarded or left incomplete.
-   *  - Running tasks may be interrupted depending on worker stop semantics.
+   *  - Queued tasks are discarded.
+   *  - Running tasks are not interrupted mid-call; they finish and then exit.
    *  - Ensure any external synchronization or resource cleanup is done prior to
    * invoking this.
    */
   void shutdown() {
-    stat_.store(STOPPED, std::memory_order_release);
-    // Clean the queues and release resources.
-    ThreadFuncPtr func_ptr;
-    while (fast_queue_.pop(func_ptr)) {
-      destroy_thread_func(func_ptr);
-      on_task_finished();
-    }
-    while (slow_queue_.pop(func_ptr)) {
-      destroy_thread_func(func_ptr);
-      on_task_finished();
-    }
-
     std::vector<ThreadWorkerPtr> workers;
+
+    reap_exited_workers();
+
     {
       std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mtx_);
-      std::lock_guard<std::mutex> lock(map_mtx_);
-      workers.reserve(thread_map_.size());
-      for (auto& [_, worker] : thread_map_) {
+      std::lock_guard<std::mutex> lock(state_mtx_);
+      if (stat_ == STOPPED) {
+        return;
+      }
+
+      stat_ = STOPPING;
+
+      // Reason: queued work must be destroyed while holding the same mutex that
+      // guards queue sizes and lifecycle state.
+      // Effect: `shutdown()` no longer races with workers draining tasks, so it
+      // cannot underflow the pending count or leave futures waiting forever.
+      //
+      // The sequence is intentional:
+      // 1. stop accepting new work
+      // 2. drop queued-but-not-running work
+      // 3. wake workers so in-flight tasks can finish and exit
+      //
+      // Reordering these steps reintroduces the old deadlock windows where one
+      // side thinks work still exists and the other side already consumed the
+      // corresponding wake-up.
+      clear_queued_tasks_locked();
+      state_cv_.notify_all();
+
+      workers.reserve(workers_.size());
+      for (auto& worker : workers_) {
         if (worker) {
-          worker->set_stop();
           workers.emplace_back(std::move(worker));
         }
       }
-      thread_map_.clear();
+      workers_.clear();
     }
 
-    if (!workers.empty()) {
-      task_counter_.release(static_cast<std::ptrdiff_t>(workers.size()));
-    }
+    join_workers(workers);
 
-    for (auto& worker : workers) {
-      if (worker) {
-        worker->join();
-      }
-    }
-
-    living_thread_num_.store(0, std::memory_order_release);
-    while (task_counter_.try_acquire()) {
+    {
+      std::lock_guard<std::mutex> lock(state_mtx_);
+      stat_ = STOPPED;
+      live_worker_num_ = 0;
+      idle_worker_num_ = 0;
+      fast_queue_size_ = 0;
+      slow_queue_size_ = 0;
+      state_cv_.notify_all();
     }
   }
 
   /**
    * Restart the thread pool if it is not currently running.
    *
-   * This method transitions the internal status from STOPPED to RUNNING using
-   * an atomic compare-and-exchange loop with acquire-release semantics to
-   * ensure proper synchronization across threads. If the pool is already
-   * RUNNING, the call is a no-op.
+   * This method only transitions the pool from STOPPED back to RUNNING. It
+   * does not recreate workers eagerly; workers are started lazily by the next
+   * accepted submission, which keeps restart cheap and keeps lifecycle logic in
+   * one place.
    *
-   * Thread-safety: Safe to call concurrently; only one caller will perform the
-   * transition, others will observe RUNNING and return.
+   * Thread-safety: lifecycle methods are serialized by `lifecycle_mtx_`, so a
+   * restart cannot interleave with join/shutdown halfway through their stop
+   * sequence.
    */
   void restart() {
-    if (stat_.load() == RUNNING) {
-      return;
-    }
-    Status stat = STOPPED;
-    while (!stat_.compare_exchange_weak(stat, RUNNING, std::memory_order_acq_rel,
-                                        std::memory_order_acquire)) {
-      if (stat == RUNNING) {
-        break;
-      } else {
-        stat = STOPPED;
-      }
+    reap_exited_workers();
+
+    std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mtx_);
+    std::lock_guard<std::mutex> lock(state_mtx_);
+    if (stat_ == STOPPED) {
+      stat_ = RUNNING;
     }
   }
 
@@ -816,30 +820,93 @@ class BThreadPool
   }
 
  private:
-  bool should_accept_new_tasks() const noexcept {
-    return stat_.load(std::memory_order_acquire) == RUNNING;
-  }
+  // Design note:
+  // The pool deliberately uses one state mutex (`state_mtx_`) plus one
+  // condition variable (`state_cv_`) for all ordering-sensitive operations:
+  // submission, queue bookkeeping, worker sleep/wake, shrink, and lifecycle.
+  //
+  // The important sequencing rules are:
+  // 1. Submission decides whether a new worker is needed before the task is
+  //    accepted, so thread-start failures cannot leave a counted task behind
+  //    with nobody able to execute it.
+  // 2. A worker object is inserted into `workers_` before its std::thread is
+  //    started, so join/shutdown can never miss a live worker.
+  // 3. `join()` first flips the state to JOINING, waits for
+  //    `pending_task_num_ == 0`, then moves workers out and joins them.
+  // 4. `shutdown()` first flips the state to STOPPING, drops queued work under
+  //    the same mutex, then wakes workers so running tasks can finish and exit.
+  //
+  // Keeping these steps under one lock removes the deadlock-prone "half old
+  // state, half new state" windows that existed when semaphore permits,
+  // pending counters, and worker ownership were updated independently.
+  enum class QueuePreference : unsigned char { kPreferFast, kSlowOnly };
+  enum Status : unsigned char { RUNNING, JOINING, STOPPING, STOPPED };
 
-  void on_task_accepted() noexcept {
-    pending_task_num_.fetch_add(1, std::memory_order_acq_rel);
-  }
+  class ThreadWorker {
+   public:
+    ThreadWorker() = default;
+    ThreadWorker(const ThreadWorker&) = delete;
+    ThreadWorker(ThreadWorker&&) noexcept = delete;
+    ThreadWorker& operator=(const ThreadWorker&) = delete;
+    ThreadWorker& operator=(ThreadWorker&&) noexcept = delete;
 
-  void on_task_finished() noexcept {
-    auto prev = pending_task_num_.fetch_sub(1, std::memory_order_acq_rel);
-    assert(prev > 0);
-    if (prev == 1) {
-      pending_cv_.notify_all();
+    ~ThreadWorker() {
+      join();
     }
+
+    void join() noexcept {
+      if (thread_.joinable()) {
+        if (thread_.get_id() == std::this_thread::get_id()) {
+          thread_.detach();
+        } else {
+          thread_.join();
+        }
+      }
+    }
+
+    std::thread thread_;
+    bool exited_{false};
+  };
+
+  bool should_accept_new_tasks_locked() const noexcept {
+    return stat_ == RUNNING;
+  }
+
+  void on_task_accepted_locked() noexcept {
+    ++pending_task_num_;
+  }
+
+  void on_task_finished_locked() noexcept {
+    assert(pending_task_num_ > 0);
+    --pending_task_num_;
+  }
+
+  size_t effective_max_thread_num() const noexcept {
+    return std::max<std::size_t>(1, param_.max_thread_num);
   }
 
   size_t effective_core_thread_num() const noexcept {
-    // Keep one always-available worker even when core_thread_num is configured
-    // as 0, so queued tasks can still make forward progress.
-    return param_.core_thread_num == 0 ? 1 : param_.core_thread_num;
+    return std::min(effective_max_thread_num(),
+                    std::max<std::size_t>(1, param_.core_thread_num));
   }
 
   bool use_fast_queue() const noexcept {
     return param_.fast_queue_capacity != 0;
+  }
+
+  bool has_queued_tasks_locked() const noexcept {
+    return fast_queue_size_ != 0 || slow_queue_size_ != 0;
+  }
+
+  std::chrono::milliseconds idle_worker_timeout() const noexcept {
+    return std::chrono::milliseconds(param_.thread_clean_interval);
+  }
+
+  bool should_start_worker_for_new_task_locked() const noexcept {
+    if (live_worker_num_ < effective_core_thread_num()) {
+      return true;
+    }
+    return idle_worker_num_ == 0 && live_worker_num_ < effective_max_thread_num();
   }
 
   template <typename Fn>
@@ -866,270 +933,247 @@ class BThreadPool
 
   ThreadWorkerPtr make_thread_worker();
 
-  bool post(ThreadFuncPtr func_ptr) {
-    std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mtx_);
-    if (!should_accept_new_tasks()) {
-      return false;
+  ThreadFuncPtr pop_task_locked() {
+    ThreadFuncPtr func = nullptr;
+    if (fast_queue_size_ != 0 && fast_queue_.pop(func)) {
+      --fast_queue_size_;
+      return func;
     }
-    on_task_accepted();
-    if (!should_accept_new_tasks()) {
-      on_task_finished();
+    if (slow_queue_size_ != 0 && slow_queue_.pop(func)) {
+      --slow_queue_size_;
+      return func;
+    }
+    return nullptr;
+  }
+
+  void clear_queued_tasks_locked() noexcept {
+    ThreadFuncPtr func = nullptr;
+    while (fast_queue_.pop(func)) {
+      if (fast_queue_size_ != 0) {
+        --fast_queue_size_;
+      }
+      destroy_thread_func(func);
+      on_task_finished_locked();
+    }
+    while (slow_queue_.pop(func)) {
+      if (slow_queue_size_ != 0) {
+        --slow_queue_size_;
+      }
+      destroy_thread_func(func);
+      on_task_finished_locked();
+    }
+    if (pending_task_num_ == 0) {
+      state_cv_.notify_all();
+    }
+  }
+
+  void mark_worker_exited_locked(ThreadWorker* worker) noexcept {
+    assert(worker != nullptr);
+    assert(live_worker_num_ > 0);
+    // This flag is written while holding `state_mtx_`, and reaped later by
+    // non-worker threads. That ordering matters: workers only decide "I am
+    // done", while ownership transfer and `join()` happen elsewhere.
+    worker->exited_ = true;
+    --live_worker_num_;
+    state_cv_.notify_all();
+  }
+
+  void start_worker_locked() {
+    auto worker = make_thread_worker();
+    auto* raw_worker = worker.get();
+    workers_.emplace_back(std::move(worker));
+
+    try {
+      // Reason: register the worker object before the thread starts running.
+      // Effect: `join()`/`shutdown()` always see every live worker and cannot
+      // miss a thread that started between "spawn" and "bookkeeping".
+      raw_worker->thread_ = std::thread([this, raw_worker] { worker_loop(raw_worker); });
+      ++live_worker_num_;
+    } catch (...) {
+      auto it = std::find_if(workers_.begin(), workers_.end(),
+                             [raw_worker](const ThreadWorkerPtr& current) {
+                               return current.get() == raw_worker;
+                             });
+      if (it != workers_.end()) {
+        workers_.erase(it);
+      }
+      throw;
+    }
+  }
+
+  std::vector<ThreadWorkerPtr> collect_exited_workers() {
+    std::vector<ThreadWorkerPtr> exited_workers;
+    std::lock_guard<std::mutex> lock(state_mtx_);
+    auto it = workers_.begin();
+    while (it != workers_.end()) {
+      if (*it && (*it)->exited_) {
+        exited_workers.emplace_back(std::move(*it));
+        it = workers_.erase(it);
+      } else {
+        ++it;
+      }
+    }
+    return exited_workers;
+  }
+
+  void join_workers(std::vector<ThreadWorkerPtr>& workers) noexcept {
+    for (auto& worker : workers) {
+      if (worker) {
+        // Join always happens outside `state_mtx_`, otherwise a worker trying to
+        // report its final state would deadlock behind the joiner.
+        worker->join();
+      }
+    }
+  }
+
+  void reap_exited_workers() {
+    auto exited_workers = collect_exited_workers();
+    join_workers(exited_workers);
+  }
+
+  bool enqueue_task(ThreadFuncPtr func_ptr, QueuePreference preference) {
+    reap_exited_workers();
+
+    std::lock_guard<std::mutex> lock(state_mtx_);
+    if (!should_accept_new_tasks_locked()) {
       return false;
     }
 
-    bool queued = false;
-    try {
-    const auto effective_core = effective_core_thread_num();
-    auto curr_num = living_thread_num_.load(std::memory_order_acquire);
-    while (curr_num < effective_core) {
-      if (living_thread_num_.compare_exchange_weak(
-              curr_num, curr_num + 1, std::memory_order_acq_rel, std::memory_order_acquire)) {
-        // Get the lock.
-        // Create a thread to execute the task immediately.
-        auto worker_ptr = make_thread_worker();
-        ThreadWorker::run(this, std::move(worker_ptr));
-        break;
-      }
+    // Start or reserve execution capacity before the task becomes visible.
+    // This ordering is intentional: if thread creation throws here, the caller
+    // sees a failed submission instead of a permanently pending task.
+    if (should_start_worker_for_new_task_locked()) {
+      start_worker_locked();
     }
-    // Push the task to the queue.
-    if (use_fast_queue() && fast_queue_.push(func_ptr)) {
-      queued = true;
-      task_counter_.release();
-      return true;
+
+    on_task_accepted_locked();
+    if (preference == QueuePreference::kPreferFast && use_fast_queue() && fast_queue_.push(func_ptr)) {
+      ++fast_queue_size_;
     } else {
-      curr_num = living_thread_num_.load(std::memory_order_acquire);
-      // Create a new thread when all threads are occupied and new threads
-      // are available.
-      while (curr_num < param_.max_thread_num) {
-        if (living_thread_num_.compare_exchange_weak(
-                curr_num, curr_num + 1, std::memory_order_acq_rel, std::memory_order_acquire)) {
-          // Get the lock.
-          // Create a thread to execute the task immediately.
-          auto worker_ptr = make_thread_worker();
-          ThreadWorker::run(this, std::move(worker_ptr));
-          break;
-        }
-      }
-      // Push the task into the slow queue to wait.
       slow_queue_.push(func_ptr);
-      queued = true;
-      task_counter_.release();
-      return true;
+      ++slow_queue_size_;
     }
+
+    // Reason: workers now sleep on the same condition variable that protects
+    // queue state and stop state.
+    // Effect: one accepted task always translates into one wake-up signal, so
+    // we avoid the lost-permit bugs from the previous semaphore-based design.
+    state_cv_.notify_one();
+    return true;
+  }
+
+  bool post(ThreadFuncPtr func_ptr) {
+    try {
+      return enqueue_task(func_ptr, QueuePreference::kPreferFast);
     } catch (...) {
-      if (!queued) {
-        destroy_thread_func(func_ptr);
-      }
-      on_task_finished();
+      destroy_thread_func(func_ptr);
       throw;
     }
   }
 
   bool defer(ThreadFuncPtr func_ptr) {
-    std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mtx_);
-    if (!should_accept_new_tasks()) {
-      return false;
-    }
-    on_task_accepted();
-    if (!should_accept_new_tasks()) {
-      on_task_finished();
-      return false;
-    }
-
-    bool queued = false;
     try {
-    const auto effective_core = effective_core_thread_num();
-    // If the thread is less than expected, then create a new one.
-    auto curr_num = living_thread_num_.load(std::memory_order_acquire);
-    while (curr_num < effective_core) {
-      if (living_thread_num_.compare_exchange_weak(
-              curr_num, curr_num + 1, std::memory_order_acq_rel, std::memory_order_acquire)) {
-        // Get the lock.
-        // Create a thread to execute the task immediately.
-        auto worker_ptr = make_thread_worker();
-        ThreadWorker::run(this, std::move(worker_ptr));
-        break;
-      }
-    }
-    // Push the task into the slow queue to wait directly.
-    slow_queue_.push(func_ptr);
-    queued = true;
-    task_counter_.release();
-    return true;
+      return enqueue_task(func_ptr, QueuePreference::kSlowOnly);
     } catch (...) {
-      if (!queued) {
-        destroy_thread_func(func_ptr);
-      }
-      on_task_finished();
+      destroy_thread_func(func_ptr);
       throw;
     }
   }
 
-  class ThreadWorker {
-   public:
-    static void run(BThreadPool* const pool, ThreadWorkerPtr self) noexcept;
-
-    ThreadWorker() : should_stop_(false) {}
-
-    ThreadWorker(const ThreadWorker&) = delete;
-    ThreadWorker(ThreadWorker&&) noexcept = delete;
-    ThreadWorker& operator=(const ThreadWorker&) = delete;
-    ThreadWorker& operator=(ThreadWorker&&) noexcept = delete;
-
-    void join() noexcept {
-      std::lock_guard<std::mutex> lock(mtx_);
-      if (thread_.joinable()) {
-        thread_.join();
+  void worker_loop(ThreadWorker* worker) noexcept {
+    struct WorkerScope {
+      explicit WorkerScope(BThreadPool* pool) : previous_pool(BThreadPool::current_pool_) {
+        BThreadPool::dispatch_depth_ = 1;
+        BThreadPool::current_pool_ = pool;
       }
-    }
-
-    void detach() noexcept {
-      std::lock_guard<std::mutex> lock(mtx_);
-      if (thread_.joinable()) {
-        thread_.detach();
+      ~WorkerScope() {
+        BThreadPool::dispatch_depth_ = 0;
+        BThreadPool::current_pool_ = previous_pool;
       }
-    }
 
-    ~ThreadWorker() {
-      set_stop();
-      join();
-    }
+      BThreadPool* previous_pool;
+    } scope(this);
 
-    bool should_stop() const noexcept {
-      return should_stop_.load();
-    }
-
-    void set_stop() noexcept {
-      should_stop_.store(true);
-    }
-
-   private:
-    std::mutex mtx_;
-    ThreadFunc func_;
-    std::thread thread_;
-    std::atomic<bool> should_stop_;
-  };
-
-  class ThreadWorkerFunctor {
-   public:
-    explicit ThreadWorkerFunctor(BThreadPool* const pool, ThreadWorker* worker)
-        : pool_(pool), worker_(worker) {}
-
-    void operator()() noexcept {
-      // Set some runtime status, to mark that
-      // the thread running is in the thread pool.
-      dispatch_depth_++;
-      pool_->current_pool_ = pool_;
-
-      for (;;) {
-        auto status = pool_->stat_.load(std::memory_order_acquire);
-        if (status == STOPPING) {
-          auto func = try_get_task();
+    for (;;) {
+      ThreadFuncPtr func = nullptr;
+      {
+        std::unique_lock<std::mutex> lock(state_mtx_);
+        for (;;) {
+          // Queue selection is always done while holding `state_mtx_`. This is
+          // slower than a pure lock-free fast path, but it gives join/shutdown
+          // a single source of truth for "is there still visible work?".
+          func = pop_task_locked();
           if (func) {
-            execute_and_delete_function(func);
-            continue;
-          }
-          if (worker_->should_stop() ||
-              pool_->pending_task_num_.load(std::memory_order_acquire) == 0) {
             break;
           }
-          std::this_thread::yield();
-          continue;
-        }
 
-        if (!pool_->task_counter_.try_acquire()) {
-          if (try_cleanup()) {
+          if (stat_ == STOPPING) {
+            mark_worker_exited_locked(worker);
             return;
           }
-          pool_->task_counter_.acquire();
-        }
 
-        auto func = try_get_task();
-        if (!func) {
-          auto current_status = pool_->stat_.load(std::memory_order_acquire);
-          if (current_status == STOPPED || worker_->should_stop()) {
-            break;
+          if (stat_ == JOINING) {
+            // In JOINING we never accept new work again. Workers therefore only
+            // have two legal outcomes: find already-queued work, or sleep until
+            // the remaining in-flight work count reaches zero.
+            if (pending_task_num_ == 0) {
+              mark_worker_exited_locked(worker);
+              return;
+            }
+
+            ++idle_worker_num_;
+            state_cv_.wait(lock, [this] {
+              return stat_ == STOPPING || has_queued_tasks_locked() || pending_task_num_ == 0;
+            });
+            --idle_worker_num_;
+            continue;
           }
-          std::this_thread::yield();
-          continue;
-        }
-        execute_and_delete_function(func);
-      }
-    }
 
-   private:
-    void execute_and_delete_function(ThreadFuncPtr func) const noexcept {
-      // Check whether the function is a null ptr.
-      if (func) {
-        try {
-          (*func)();
-        } catch (...) {
-          // Ignore exceptions.
-        }
-        pool_->destroy_thread_func(func);
-        pool_->on_task_finished();
-      }
-    }
+          ++idle_worker_num_;
+          if (live_worker_num_ > effective_core_thread_num()) {
+            // Reason: idle shrink is handled by a timed wait under the same
+            // state mutex instead of a detached self-cleanup path.
+            // Effect: extra threads retire without racing `join()`/`shutdown()`
+            // for ownership of their worker objects.
+            const bool woke_for_work =
+                state_cv_.wait_for(lock, idle_worker_timeout(), [this] {
+                  return stat_ != RUNNING || has_queued_tasks_locked();
+                });
+            --idle_worker_num_;
 
-    ThreadFuncPtr try_get_task() {
-      ThreadFuncPtr func = nullptr;
-      // Try to first
-      auto succ = pool_->fast_queue_.pop(func);
-      if (succ) {
-        return func;
-      } else if ((succ = pool_->slow_queue_.pop(func))) {
-        return func;
-      }
-      return nullptr;
-    }
-
-    bool try_cleanup() {
-      if (pool_->stat_.load(std::memory_order_acquire) != RUNNING) {
-        return false;
-      }
-      std::unique_lock<std::mutex> lifecycle_lock(pool_->lifecycle_mtx_);
-      if (pool_->stat_.load(std::memory_order_acquire) != RUNNING) {
-        return false;
-      }
-      if (pool_->pending_task_num_.load(std::memory_order_acquire) > 0) {
-        return false;
-      }
-      const auto effective_core = pool_->effective_core_thread_num();
-      std::ptrdiff_t curr_num = pool_->living_thread_num_.load(std::memory_order_acquire);
-      while (curr_num > effective_core) {
-        if (pool_->living_thread_num_.compare_exchange_weak(
-                curr_num, curr_num - 1, std::memory_order_acq_rel, std::memory_order_acquire)) {
-          // Successfully get the lock.
-          std::unique_lock<std::mutex> lock(pool_->map_mtx_);
-          auto tid = std::this_thread::get_id();
-          auto it = pool_->thread_map_.find(tid);
-          if (it != pool_->thread_map_.end()) {
-            // Move ownership out of the worker map for async cleanup task.
-            auto worker_ptr(std::move(it->second));
-            pool_->thread_map_.erase(it);
-            // Release the lock to avoid dead lock before posting.
-            lock.unlock();
-            lifecycle_lock.unlock();
-            // Cleanup in a move-only task.
-            worker_ptr->set_stop();
-            worker_ptr->detach();
-            worker_ptr.reset();
-            return true;
+            if (!woke_for_work && stat_ == RUNNING && !has_queued_tasks_locked() &&
+                live_worker_num_ > effective_core_thread_num()) {
+              mark_worker_exited_locked(worker);
+              return;
+            }
           } else {
-            pool_->living_thread_num_.fetch_add(1, std::memory_order_acq_rel);
-            return false;
+            // Core workers wait indefinitely. They are the minimum execution
+            // capacity that guarantees forward progress even after temporary
+            // bursts have drained away.
+            state_cv_.wait(lock, [this] {
+              return stat_ != RUNNING || has_queued_tasks_locked();
+            });
+            --idle_worker_num_;
           }
         }
       }
-      // The number of thread is same as or lower than the core thread number.
-      // No need to clean.
-      return false;
-    }
 
-    ThreadWorker* const worker_;
-    // Temperory sotre the pointer of the thread pool.
-    BThreadPool* const pool_;
-  };
+      try {
+        (*func)();
+      } catch (...) {
+        // Ignore exceptions from fire-and-forget tasks.
+      }
+      destroy_thread_func(func);
+
+      std::lock_guard<std::mutex> lock(state_mtx_);
+      on_task_finished_locked();
+      // Wake lifecycle waiters after every finish while stopping, and also wake
+      // them when the last accepted task leaves the system.
+      if (stat_ != RUNNING || pending_task_num_ == 0) {
+        state_cv_.notify_all();
+      }
+    }
+  }
 
   // Parameter of the thread pool.
   const BThreadPoolParam param_;
@@ -1138,23 +1182,17 @@ class BThreadPool
   // Task queues, including a fast queue and a slow queue.
   SlowQueueType slow_queue_;
   FastQueueType fast_queue_;
-  std::counting_semaphore<> task_counter_;
 
   std::mutex lifecycle_mtx_;
-  std::mutex pending_mtx_;
-  std::condition_variable pending_cv_;
-
-  // Thread map, which can find the thread worker and clean.
-  std::mutex map_mtx_;
-  ThreadMapType thread_map_;
-
-  // Determine whether the pool should stop.
-  enum Status : unsigned char { RUNNING, STOPPING, STOPPED };
-  std::atomic<Status> stat_;
-
-  // Indicate the number of working thread.
-  std::atomic<std::ptrdiff_t> living_thread_num_;
-  std::atomic<std::ptrdiff_t> pending_task_num_;
+  std::mutex state_mtx_;
+  std::condition_variable state_cv_;
+  Status stat_;
+  WorkerContainer workers_;
+  std::size_t live_worker_num_;
+  std::size_t idle_worker_num_;
+  std::size_t pending_task_num_;
+  std::size_t fast_queue_size_;
+  std::size_t slow_queue_size_;
 
   // The max recursion depth limit.
   static constexpr std::size_t kMaxDispatchDepth = 32;
@@ -1187,18 +1225,6 @@ BThreadPool<Allocator>::make_thread_worker() {
     throw;
   }
   return ThreadWorkerPtr(ptr, ThreadWorkerDeleter{allocator_});
-}
-
-template <typename Allocator>
-inline void BThreadPool<Allocator>::ThreadWorker::run(BThreadPool* const pool,
-                                                      ThreadWorkerPtr self) noexcept {
-  self->func_ = ThreadWorkerFunctor{pool, self.get()};
-  self->thread_ = std::thread(std::move(self->func_));
-  auto tid = self->thread_.get_id();
-  {
-    std::lock_guard<std::mutex> lock(pool->map_mtx_);
-    pool->thread_map_.emplace(tid, std::move(self));
-  }
 }
 
 }  // namespace bthpool::detail

@@ -1,14 +1,19 @@
-include(FetchContent)
+find_package(GTest CONFIG QUIET)
 
-FetchContent_Declare(
-	googletest
-	URL https://github.com/google/googletest/archive/refs/tags/v1.14.0.zip
-)
+if(NOT GTest_FOUND)
+  include(FetchContent)
 
-# For Windows: prevent overriding the parent project's compiler/linker settings
-set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
+  FetchContent_Declare(
+    googletest
+    URL https://github.com/google/googletest/archive/refs/tags/v1.14.0.zip
+  )
 
-FetchContent_MakeAvailable(googletest)
+  # Prefer a system GTest when CI already provides it. Falling back to
+  # FetchContent keeps the project self-contained for other environments.
+  set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
+
+  FetchContent_MakeAvailable(googletest)
+endif()
 
 find_package(Threads REQUIRED)
 
