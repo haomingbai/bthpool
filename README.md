@@ -2,6 +2,11 @@
 
 A lightweight, modern C++ thread pool focused on safety, simplicity, and performance. This README shows how to build, use, and understand the design of `bthpool`.
 
+Requirements:
+- CMake 3.16+
+- A C++20 compiler
+- Boost headers/system libraries only if `BTHPOOL_WITH_BOOST=ON`
+
 ## Quick Start
 
 ### Build and run examples/tests

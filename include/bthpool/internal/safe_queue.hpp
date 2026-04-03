@@ -26,7 +26,7 @@
  *
  * @author  Haoming Bai <haomingbai@hotmail.com>
  * @date    2025-12-07
- * @version 0.1.0
+ * @version 0.4.1
  * @copyright Copyright © 2025 Haoming Bai
  * @license  MIT
  */

@@ -27,7 +27,7 @@
  *
  * @author  Haoming Bai <haomingbai@hotmail.com>
  * @date    2025-12-07
- * @version 0.1.0
+ * @version 0.4.1
  * @copyright Copyright © 2025 Haoming Bai
  * @license  MIT
  * @see      include/bthpool/internal/safe_queue.hpp
@@ -106,7 +106,9 @@ class BThreadPool
   };
   using ThreadWorkerPtr = std::unique_ptr<ThreadWorker, ThreadWorkerDeleter>;
 
-  using ThreadFunc = std::move_only_function<void()>;
+  // C++20 does not provide std::move_only_function. packaged_task keeps
+  // move-only callable support while preserving the queue's ownership model.
+  using ThreadFunc = std::packaged_task<void()>;
   using ThreadFuncPtr = ThreadFunc*;
   using ThreadFuncAllocator = RebindAllocator<ThreadFunc>;
   using SlowQueueContainer = std::deque<ThreadFuncPtr, RebindAllocator<ThreadFuncPtr>>;

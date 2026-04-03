@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.16)
 
 project(bthpool
-  VERSION 0.4.0
+  VERSION 0.4.1
   DESCRIPTION "A lightweight, modern C++ thread pool focused on safety, simplicity, and performance."
   LANGUAGES CXX)
 
@@ -19,7 +19,7 @@ target_include_directories(bthpool
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>)
 
-target_compile_features(bthpool INTERFACE cxx_std_23)
+target_compile_features(bthpool INTERFACE cxx_std_20)
 
 target_compile_definitions(bthpool INTERFACE
   $<$<BOOL:${BTHPOOL_WITH_BOOST}>:BTHPOOL_HAS_BOOST_ASIO=1;USE_BOOST_ASIO_EXECUTOR>

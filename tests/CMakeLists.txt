@@ -24,19 +24,19 @@ add_test(NAME basic_run COMMAND test_bthpool)
 
 add_executable(test_threadpool_basic test_threadpool_basic.cpp)
 target_link_libraries(test_threadpool_basic PRIVATE bthpool GTest::gtest_main Threads::Threads)
-target_compile_features(test_threadpool_basic PRIVATE cxx_std_23)
+target_compile_features(test_threadpool_basic PRIVATE cxx_std_20)
 
 add_executable(test_queue_basic test_queue_basic.cpp)
 target_link_libraries(test_queue_basic PRIVATE bthpool GTest::gtest_main Threads::Threads)
-target_compile_features(test_queue_basic PRIVATE cxx_std_23)
+target_compile_features(test_queue_basic PRIVATE cxx_std_20)
 
 add_executable(test_executor_compat test_executor_compat.cpp)
 target_link_libraries(test_executor_compat PRIVATE bthpool GTest::gtest_main Threads::Threads)
-target_compile_features(test_executor_compat PRIVATE cxx_std_23)
+target_compile_features(test_executor_compat PRIVATE cxx_std_20)
 
 add_executable(test_pmr_allocator test_pmr_allocator.cpp)
 target_link_libraries(test_pmr_allocator PRIVATE bthpool GTest::gtest_main Threads::Threads)
-target_compile_features(test_pmr_allocator PRIVATE cxx_std_23)
+target_compile_features(test_pmr_allocator PRIVATE cxx_std_20)
 
 include(GoogleTest)
 gtest_discover_tests(test_threadpool_basic)

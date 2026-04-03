@@ -47,7 +47,7 @@ TEST(ThreadPoolBasic, FutureAndExceptionPropagation) {
                                                int (*)()>()) {
     auto f1 = pool.futured_post([] { return 7; });
     auto f2 =
-        pool.futured_post([] -> int { throw std::runtime_error("boom"); });
+        pool.futured_post([]() -> int { throw std::runtime_error("boom"); });
     auto f3 = pool.futured_post([] {});
 
     EXPECT_EQ(f1.get(), 7);
