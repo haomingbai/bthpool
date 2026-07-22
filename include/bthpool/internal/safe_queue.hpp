@@ -134,7 +134,6 @@ concept RebindableAllocatorFor = requires {
 } && std::copy_constructible<Allocator> && std::default_initializable<Allocator>;
 
 template <typename T, typename Allocator = std::allocator<T>>
-  requires RebindableAllocatorFor<Allocator, T>
 class LockfreeFixedQueue {
   static_assert(std::is_trivially_destructible_v<T> && std::is_nothrow_constructible_v<T>,
                 "LockfreeFixedQueue requires T to be trivially destructible "
